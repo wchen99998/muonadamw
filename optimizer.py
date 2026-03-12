@@ -236,43 +236,6 @@ def _batched_zeropower_tensor(
     return ortho_grads
 
 
-def _apply_muon_weight_update(
-    bucket: dict,
-    ortho_updates: Tensor,
-    lr: float,
-    weight_decay: float,
-) -> None:
-    if bucket["use_triton_weight_update"]:
-        grid = lambda meta: (
-            len(bucket["params"]),
-            triton.cdiv(bucket["rows"], meta["BLOCK_M"]),
-            triton.cdiv(bucket["cols"], meta["BLOCK_N"]),
-        )
-        _fused_muon_weight_update_ptr_kernel[grid](
-            bucket["param_ptrs"],
-            ortho_updates,
-            ortho_updates.stride(0),
-            ortho_updates.stride(1),
-            ortho_updates.stride(2),
-            bucket["rows"],
-            bucket["cols"],
-            bucket["param_stride0"],
-            bucket["param_stride1"],
-            1 - lr * weight_decay,
-            -bucket["adjusted_lr"],
-            BLOCK_M=32,
-            BLOCK_N=32,
-            num_warps=4,
-        )
-    else:
-        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
-        torch._foreach_add_(
-            bucket["params"],
-            list(ortho_updates.unbind(0)),
-            alpha=-bucket["adjusted_lr"],
-        )
-
-
 class MuonAdamW:
     """Combined Muon+AdamW optimizer.
 
@@ -360,10 +323,6 @@ class MuonAdamW:
                     momentum_batch = torch.zeros_like(batch_buffer)
                     bucket["batch_buffer"] = batch_buffer
                     bucket["batch_views"] = [batch_buffer[i] for i in range(batch_buffer.size(0))]
-                    bucket["effective_batch_views"] = [
-                        view.T if bucket["transposed"] else view
-                        for view in bucket["batch_views"]
-                    ]
                     bucket["momentum_batch"] = momentum_batch
                     bucket["momentum_views"] = [
                         momentum_batch[i] for i in range(momentum_batch.size(0))
@@ -376,56 +335,7 @@ class MuonAdamW:
                         )
                     for idx, buf in zip(bucket["indices"], bucket["momentum_views"]):
                         momentum_buffers[idx] = buf
-
-                effective_shape_buckets = []
-                effective_shape_to_bucket = {}
-                for bucket in shape_buckets:
-                    effective_shape = (
-                        (bucket["cols"], bucket["rows"])
-                        if bucket["transposed"]
-                        else (bucket["rows"], bucket["cols"])
-                    )
-                    effective_bucket = effective_shape_to_bucket.get(effective_shape)
-                    if effective_bucket is None:
-                        effective_bucket = {
-                            "shape_buckets": [],
-                            "rows": effective_shape[0],
-                            "cols": effective_shape[1],
-                        }
-                        effective_shape_to_bucket[effective_shape] = effective_bucket
-                        effective_shape_buckets.append(effective_bucket)
-                    effective_bucket["shape_buckets"].append(bucket)
-
-                for effective_bucket in effective_shape_buckets:
-                    if len(effective_bucket["shape_buckets"]) == 1:
-                        continue
-                    effective_batch = torch.empty(
-                        (
-                            sum(
-                                len(bucket["params"])
-                                for bucket in effective_bucket["shape_buckets"]
-                            ),
-                            effective_bucket["rows"],
-                            effective_bucket["cols"],
-                        ),
-                        device=effective_bucket["shape_buckets"][0]["params"][0].device,
-                        dtype=torch.bfloat16,
-                    )
-                    effective_bucket["batch_buffer"] = effective_batch
-                    effective_bucket["batch_views"] = [
-                        effective_batch[i] for i in range(effective_batch.size(0))
-                    ]
-                    effective_bucket["source_views"] = []
-                    start = 0
-                    for bucket in effective_bucket["shape_buckets"]:
-                        count = len(bucket["params"])
-                        bucket["effective_slice"] = slice(start, start + count)
-                        start += count
-                        effective_bucket["source_views"].extend(
-                            bucket["effective_batch_views"]
-                        )
                 muon_group["shape_buckets"] = shape_buckets
-                muon_group["effective_shape_buckets"] = effective_shape_buckets
                 self._muon_groups.append(muon_group)
                 self._muon_params.extend(params)
                 for param, buf in zip(params, momentum_buffers):
@@ -502,36 +412,41 @@ class MuonAdamW:
                         BLOCK_SIZE=1024,
                         num_warps=8,
                     )
-                for effective_bucket in group["effective_shape_buckets"]:
-                    if len(effective_bucket["shape_buckets"]) == 1:
-                        bucket = effective_bucket["shape_buckets"][0]
-                        ortho_updates = _batched_zeropower_tensor(
-                            bucket["batch_buffer"],
-                            transposed=bucket["transposed"],
-                            ns_coefficients=ns_coefficients,
-                            ns_steps=ns_steps,
-                            eps=eps,
-                        )
-                        _apply_muon_weight_update(bucket, ortho_updates, lr, weight_decay)
-                        continue
-
-                    torch._foreach_copy_(
-                        effective_bucket["batch_views"],
-                        effective_bucket["source_views"],
-                    )
                     ortho_updates = _batched_zeropower_tensor(
-                        effective_bucket["batch_buffer"],
-                        transposed=False,
+                        bucket["batch_buffer"],
+                        transposed=bucket["transposed"],
                         ns_coefficients=ns_coefficients,
                         ns_steps=ns_steps,
                         eps=eps,
                     )
-                    for bucket in effective_bucket["shape_buckets"]:
-                        bucket_updates = ortho_updates[bucket["effective_slice"]]
-                        if bucket["transposed"]:
-                            bucket_updates = bucket_updates.transpose(1, 2)
-                        _apply_muon_weight_update(
-                            bucket, bucket_updates, lr, weight_decay
+                    if bucket["use_triton_weight_update"]:
+                        grid = lambda meta: (
+                            len(bucket["params"]),
+                            triton.cdiv(bucket["rows"], meta["BLOCK_M"]),
+                            triton.cdiv(bucket["cols"], meta["BLOCK_N"]),
+                        )
+                        _fused_muon_weight_update_ptr_kernel[grid](
+                            bucket["param_ptrs"],
+                            ortho_updates,
+                            ortho_updates.stride(0),
+                            ortho_updates.stride(1),
+                            ortho_updates.stride(2),
+                            bucket["rows"],
+                            bucket["cols"],
+                            bucket["param_stride0"],
+                            bucket["param_stride1"],
+                            1 - lr * weight_decay,
+                            -bucket["adjusted_lr"],
+                            BLOCK_M=32,
+                            BLOCK_N=32,
+                            num_warps=4,
+                        )
+                    else:
+                        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
+                        torch._foreach_add_(
+                            bucket["params"],
+                            list(ortho_updates.unbind(0)),
+                            alpha=-bucket["adjusted_lr"],
                         )
             else:
                 torch._foreach_lerp_(bufs, grads, 1 - momentum)
