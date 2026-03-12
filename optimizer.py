@@ -449,15 +449,21 @@ class MuonAdamW:
             eps = group["eps"]
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
-            if all(param.grad is not None for param in group["params"]):
-                if ns_steps == 0:
-                    for bucket in group["shape_buckets"]:
-                        bucket_grads = bucket["grads"]
-                        for idx, param in enumerate(bucket["params"]):
-                            grad = param.grad
-                            bucket_grads[idx] = grad
-                            if grad.is_sparse:
-                                raise RuntimeError("Muon does not support sparse gradients")
+            if ns_steps == 0:
+                all_grads_present = True
+                for bucket in group["shape_buckets"]:
+                    bucket_grads = bucket["grads"]
+                    for idx, param in enumerate(bucket["params"]):
+                        grad = param.grad
+                        if grad is None:
+                            all_grads_present = False
+                            break
+                        bucket_grads[idx] = grad
+                        if grad.is_sparse:
+                            raise RuntimeError("Muon does not support sparse gradients")
+                    if not all_grads_present:
+                        break
+                if all_grads_present:
                     torch._foreach_mul_(group["params"], 1 - lr * weight_decay)
                     for bucket in group["shape_buckets"]:
                         torch._foreach_add_(
@@ -466,6 +472,7 @@ class MuonAdamW:
                             alpha=-bucket["adjusted_lr"],
                         )
                     continue
+            elif all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
                     bucket_grads = bucket["grads"]
                     for idx, param in enumerate(bucket["params"]):
