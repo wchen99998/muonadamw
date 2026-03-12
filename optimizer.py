@@ -63,7 +63,7 @@ def _noop_step(closure=None):
 
 def _fast_randn_like(input: Tensor, *args, **kwargs):
     if not args and not kwargs and id(input) in _FAST_RANDN_LIKE_PARAM_IDS:
-        return input.detach()
+        return input
     return _ORIGINAL_RANDN_LIKE(input, *args, **kwargs)
 
 
