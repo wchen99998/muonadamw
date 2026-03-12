@@ -324,7 +324,6 @@ class MuonAdamW:
                 momentum_buffers: list[Tensor | None] = [None] * len(params)
                 for bucket in shape_buckets:
                     bucket["grads"] = [None] * len(bucket["params"])
-                    bucket["grad_rows"] = [None] * len(bucket["params"])
                     batch_buffer = torch.empty(
                         (len(bucket["params"]), *bucket["params"][0].shape),
                         device=bucket["params"][0].device,
@@ -410,14 +409,12 @@ class MuonAdamW:
             if all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
                     bucket_grads = bucket["grads"]
-                    bucket_grad_rows = bucket["grad_rows"]
                     for idx, param in enumerate(bucket["params"]):
                         grad = param.grad
                         bucket_grads[idx] = grad
-                        bucket_grad_rows[idx] = grad.unsqueeze(0)
                         if grad.is_sparse:
                             raise RuntimeError("Muon does not support sparse gradients")
-                    torch.cat(bucket_grad_rows, dim=0, out=bucket["batch_buffer"])
+                    torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     numel = bucket["batch_buffer"].numel()
                     _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
                         bucket["batch_buffer"],
