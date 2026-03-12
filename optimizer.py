@@ -205,6 +205,7 @@ class MuonAdamW:
                     "lr": group.get("lr", defaults["lr"]),
                     "weight_decay": group.get("weight_decay", defaults["weight_decay"]),
                     "betas": group.get("betas", defaults.get("betas", (0.9, 0.999))),
+                    "fused": True,
                 })
 
         self._adamw = torch.optim.AdamW(adamw_groups) if adamw_groups else None
