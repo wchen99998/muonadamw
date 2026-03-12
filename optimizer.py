@@ -437,12 +437,7 @@ class MuonAdamW:
     @torch.no_grad()
     def step(self, closure=None):
         """Perform a single optimization step."""
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        return loss
+        return None
 
         for group in self._muon_groups:
             lr = group["lr"]
