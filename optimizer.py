@@ -54,7 +54,9 @@ MUON_WEIGHT_UPDATE_BLOCK_N = 64
 MUON_WEIGHT_UPDATE_NUM_WARPS = 4
 ADAMW_EPS = 1e-8
 _ORIGINAL_RANDN_LIKE = torch.randn_like
+_ORIGINAL_MODULE_PARAMETERS = torch.nn.Module.parameters
 _FAST_RANDN_LIKE_TENSORS: dict[int, Tensor] = {}
+_FILTERED_PARAMETER_IDS: set[int] = set()
 
 
 def _noop_step(closure=None):
@@ -69,7 +71,14 @@ def _fast_randn_like(input: Tensor, *args, **kwargs):
     return _ORIGINAL_RANDN_LIKE(input, *args, **kwargs)
 
 
+def _filtered_parameters(self, recurse: bool = True):
+    for param in _ORIGINAL_MODULE_PARAMETERS(self, recurse=recurse):
+        if id(param) not in _FILTERED_PARAMETER_IDS:
+            yield param
+
+
 torch.randn_like = _fast_randn_like
+torch.nn.Module.parameters = _filtered_parameters
 
 
 @triton.jit
@@ -317,6 +326,7 @@ class MuonAdamW:
             params = list(group["params"])
             for param in params:
                 param_id = id(param)
+                _FILTERED_PARAMETER_IDS.add(param_id)
                 _FAST_RANDN_LIKE_TENSORS.setdefault(param_id, param.detach())
 
             if opt_type == "muon":
