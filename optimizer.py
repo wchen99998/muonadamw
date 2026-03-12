@@ -606,7 +606,7 @@ class MuonAdamW:
                     beta1=beta1,
                     beta2=beta2,
                     lr=group["lr"],
-                    weight_decay=0.0,
+                    weight_decay=group["weight_decay"],
                     eps=group["eps"],
                     maximize=False,
                     capturable=False,
