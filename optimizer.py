@@ -462,7 +462,6 @@ class MuonAdamW:
                     if grad.is_sparse:
                         raise RuntimeError("Muon does not support sparse gradients")
                 if all_grads_present:
-                    torch._foreach_mul_(group["params"], 1 - lr * weight_decay)
                     torch._foreach_add_(group["params"], group_grads, alpha=-lr)
                     continue
             elif all(param.grad is not None for param in group["params"]):
