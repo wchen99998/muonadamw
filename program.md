@@ -78,7 +78,7 @@ FOREVER:
 
 ## Optimization Targets (Priority Order)
 
-1. **Replace torch.optim.Muon delegation with custom Muon step**
+1. **Replace torch.optim.Muon delegation with custom Muon step or similarly for AdamW**
    Inline the Muon algorithm: momentum → nesterov → bf16 cast → transpose → normalize →
    Newton-Schulz → transpose back → weight decay → update. This eliminates Python overhead
    from the torch.optim.Muon wrapper and enables all subsequent optimizations.
