@@ -47,6 +47,11 @@ MUON_EPS = 1e-7
 MUON_NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
 MUON_NS_STEPS = 5
 MUON_A, MUON_B, MUON_C = MUON_NS_COEFFICIENTS
+MUON_MOMENTUM_BLOCK_SIZE = 1024
+MUON_MOMENTUM_NUM_WARPS = 8
+MUON_WEIGHT_UPDATE_BLOCK_M = 32
+MUON_WEIGHT_UPDATE_BLOCK_N = 32
+MUON_WEIGHT_UPDATE_NUM_WARPS = 4
 ADAMW_EPS = 1e-8
 
 
@@ -324,11 +329,19 @@ class MuonAdamW:
                     )
                     momentum_batch = torch.zeros_like(batch_buffer)
                     bucket["batch_buffer"] = batch_buffer
+                    bucket["momentum_grid"] = (
+                        triton.cdiv(batch_buffer.numel(), MUON_MOMENTUM_BLOCK_SIZE),
+                    )
                     bucket["batch_views"] = [batch_buffer[i] for i in range(batch_buffer.size(0))]
                     bucket["momentum_batch"] = momentum_batch
                     bucket["momentum_views"] = [
                         momentum_batch[i] for i in range(momentum_batch.size(0))
                     ]
+                    bucket["weight_update_grid"] = (
+                        len(bucket["params"]),
+                        triton.cdiv(bucket["rows"], MUON_WEIGHT_UPDATE_BLOCK_M),
+                        triton.cdiv(bucket["cols"], MUON_WEIGHT_UPDATE_BLOCK_N),
+                    )
                     if bucket["use_triton_weight_update"]:
                         bucket["param_ptrs"] = torch.tensor(
                             [param.data_ptr() for param in bucket["params"]],
@@ -397,15 +410,14 @@ class MuonAdamW:
                         raise RuntimeError("Muon does not support sparse gradients")
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     numel = bucket["batch_buffer"].numel()
-                    grid = lambda meta: (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
-                    _fused_muon_momentum_nesterov_kernel[grid](
+                    _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
                         bucket["batch_buffer"],
                         bucket["momentum_batch"],
                         numel,
                         momentum,
                         nesterov=nesterov,
-                        BLOCK_SIZE=1024,
-                        num_warps=8,
+                        BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
+                        num_warps=MUON_MOMENTUM_NUM_WARPS,
                     )
                     ortho_updates = _batched_zeropower_tensor(
                         bucket["batch_buffer"],
@@ -415,12 +427,7 @@ class MuonAdamW:
                         eps=eps,
                     )
                     if bucket["use_triton_weight_update"]:
-                        grid = lambda meta: (
-                            len(bucket["params"]),
-                            triton.cdiv(bucket["rows"], meta["BLOCK_M"]),
-                            triton.cdiv(bucket["cols"], meta["BLOCK_N"]),
-                        )
-                        _fused_muon_weight_update_ptr_kernel[grid](
+                        _fused_muon_weight_update_ptr_kernel[bucket["weight_update_grid"]](
                             bucket["param_ptrs"],
                             ortho_updates,
                             ortho_updates.stride(0),
@@ -432,9 +439,9 @@ class MuonAdamW:
                             bucket["param_stride1"],
                             1 - lr * weight_decay,
                             -bucket["adjusted_lr"],
-                            BLOCK_M=32,
-                            BLOCK_N=32,
-                            num_warps=4,
+                            BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
+                            BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
+                            num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
                         )
                     else:
                         torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
