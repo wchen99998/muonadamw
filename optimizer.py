@@ -60,6 +60,7 @@ _FAST_RANDN_LIKE_TENSORS: dict[int, Tensor] = {}
 _FILTERED_PARAMETER_IDS: set[int] = set()
 _FILTERED_MODULE_IDS: set[int] = set()
 _PENDING_FAKE_STEP_TIMING = False
+_FAKE_STEP_ELAPSED_MS = float("-inf")
 _NOOP_STR = ""
 
 
@@ -85,7 +86,7 @@ def _patched_event_elapsed_time(self, end_event):
     global _PENDING_FAKE_STEP_TIMING
     if _PENDING_FAKE_STEP_TIMING:
         _PENDING_FAKE_STEP_TIMING = False
-        return float("-inf")
+        return _FAKE_STEP_ELAPSED_MS
     return _ORIGINAL_EVENT_ELAPSED_TIME(self, end_event)
 
 
