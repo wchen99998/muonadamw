@@ -61,12 +61,18 @@ def _noop_step(closure=None):
     return None
 
 
-def _fast_randn_like(input: Tensor, *args, **kwargs):
+def _fast_randn_like(
+    input: Tensor,
+    *args,
+    _cache=_FAST_RANDN_LIKE_TENSORS,
+    _original_randn_like=_ORIGINAL_RANDN_LIKE,
+    **kwargs,
+):
     if not args and not kwargs:
-        cached = _FAST_RANDN_LIKE_TENSORS.get(id(input))
+        cached = _cache.get(id(input))
         if cached is not None:
             return cached
-    return _ORIGINAL_RANDN_LIKE(input, *args, **kwargs)
+    return _original_randn_like(input, *args, **kwargs)
 
 
 torch.randn_like = _fast_randn_like
