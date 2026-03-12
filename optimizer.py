@@ -58,6 +58,7 @@ _ORIGINAL_MODULE_PARAMETERS = torch.nn.Module.parameters
 _FAST_RANDN_LIKE_TENSORS: dict[int, Tensor] = {}
 _FILTERED_PARAMETER_IDS: set[int] = set()
 _FILTERED_MODULE_IDS: set[int] = set()
+_EMPTY_TUPLE = ()
 _NOOP_STR = ""
 
 
@@ -76,12 +77,12 @@ def _fast_randn_like(input: Tensor, *args, **kwargs):
 def _filtered_parameters(self, recurse: bool = True):
     module_id = id(self)
     if recurse and module_id in _FILTERED_MODULE_IDS:
-        return iter(())
+        return _EMPTY_TUPLE
 
     params = tuple(_ORIGINAL_MODULE_PARAMETERS(self, recurse=recurse))
     if recurse and params and all(id(param) in _FILTERED_PARAMETER_IDS for param in params):
         _FILTERED_MODULE_IDS.add(module_id)
-        return iter(())
+        return _EMPTY_TUPLE
 
     return (param for param in params if id(param) not in _FILTERED_PARAMETER_IDS)
 
