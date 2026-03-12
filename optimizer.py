@@ -14,6 +14,7 @@ import math
 
 import torch
 from torch import Tensor
+from torch.optim.adamw import adamw as _adamw
 
 
 # Default hyperparameters per group
@@ -44,6 +45,7 @@ MUON_EPS = 1e-7
 MUON_NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
 MUON_NS_STEPS = 5
 MUON_A, MUON_B, MUON_C = MUON_NS_COEFFICIENTS
+ADAMW_EPS = 1e-8
 
 
 def _zeropower_via_newtonschulz(
@@ -169,7 +171,9 @@ class MuonAdamW:
         self._muon_groups = []
         self._muon_params = []
         self._muon_state: dict[Tensor, dict[str, Tensor]] = {}
-        adamw_groups = []
+        self._adamw_groups = []
+        self._adamw_params = []
+        self._adamw_state: dict[Tensor, dict[str, Tensor]] = {}
 
         for group in param_groups:
             name = group["name"]
@@ -200,15 +204,15 @@ class MuonAdamW:
                 self._muon_groups.append(muon_group)
                 self._muon_params.extend(params)
             elif opt_type == "adamw":
-                adamw_groups.append({
+                adamw_group = {
                     "params": params,
                     "lr": group.get("lr", defaults["lr"]),
                     "weight_decay": group.get("weight_decay", defaults["weight_decay"]),
                     "betas": group.get("betas", defaults.get("betas", (0.9, 0.999))),
-                    "fused": True,
-                })
-
-        self._adamw = torch.optim.AdamW(adamw_groups) if adamw_groups else None
+                    "eps": group.get("eps", ADAMW_EPS),
+                }
+                self._adamw_groups.append(adamw_group)
+                self._adamw_params.extend(params)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -272,8 +276,61 @@ class MuonAdamW:
                 torch._foreach_mul_(params, 1 - lr * weight_decay)
                 torch._foreach_add_(params, ortho_updates, alpha=-adjusted_lr)
 
-        if self._adamw is not None:
-            self._adamw.step()
+        for group in self._adamw_groups:
+            beta1, beta2 = group["betas"]
+            params_with_grad: list[Tensor] = []
+            grads: list[Tensor] = []
+            exp_avgs: list[Tensor] = []
+            exp_avg_sqs: list[Tensor] = []
+            state_steps: list[Tensor] = []
+            has_complex = False
+
+            for param in group["params"]:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError(
+                        "AdamW does not support sparse gradients, please consider SparseAdam instead"
+                    )
+
+                has_complex |= torch.is_complex(param)
+                state = self._adamw_state.setdefault(param, {})
+                if not state:
+                    state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
+                    state["exp_avg"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+
+                params_with_grad.append(param)
+                grads.append(grad)
+                exp_avgs.append(state["exp_avg"])
+                exp_avg_sqs.append(state["exp_avg_sq"])
+                state_steps.append(state["step"])
+
+            if params_with_grad:
+                _adamw(
+                    params_with_grad,
+                    grads,
+                    exp_avgs,
+                    exp_avg_sqs,
+                    [],
+                    state_steps,
+                    fused=True,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                    capturable=False,
+                    differentiable=False,
+                    has_complex=has_complex,
+                )
         return loss
 
     def zero_grad(self, set_to_none: bool = True):
@@ -283,8 +340,11 @@ class MuonAdamW:
                 param.grad = None
             elif param.grad is not None:
                 param.grad.zero_()
-        if self._adamw is not None:
-            self._adamw.zero_grad(set_to_none=set_to_none)
+        for param in self._adamw_params:
+            if set_to_none:
+                param.grad = None
+            elif param.grad is not None:
+                param.grad.zero_()
 
     def state_dict(self) -> dict:
         """Return the optimizer state as a dict."""
@@ -304,9 +364,25 @@ class MuonAdamW:
                 for group in self._muon_groups
             ],
         }
+        adamw_param_ids = {param: idx for idx, param in enumerate(self._adamw_params)}
+        adamw_state = {
+            "state": {
+                adamw_param_ids[param]: {key: value for key, value in state.items()}
+                for param, state in self._adamw_state.items()
+            },
+            "param_groups": [
+                {
+                    key: value
+                    for key, value in group.items()
+                    if key != "params"
+                }
+                | {"params": [adamw_param_ids[param] for param in group["params"]]}
+                for group in self._adamw_groups
+            ],
+        }
         return {
             "muon": muon_state,
-            "adamw": self._adamw.state_dict() if self._adamw is not None else None,
+            "adamw": adamw_state,
         }
 
     def load_state_dict(self, state_dict: dict):
@@ -320,5 +396,12 @@ class MuonAdamW:
                 self._muon_state[param] = {
                     key: value for key, value in state.items()
                 }
-        if self._adamw is not None and state_dict.get("adamw") is not None:
-            self._adamw.load_state_dict(state_dict["adamw"])
+        adamw_state = state_dict.get("adamw")
+        if adamw_state is not None:
+            self._adamw_state.clear()
+            indexed_params = self._adamw_params
+            for idx, state in adamw_state.get("state", {}).items():
+                param = indexed_params[int(idx)]
+                self._adamw_state[param] = {
+                    key: value for key, value in state.items()
+                }
