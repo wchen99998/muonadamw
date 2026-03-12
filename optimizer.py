@@ -457,27 +457,32 @@ class MuonAdamW:
                         bucket_grads[idx] = grad
                         if grad.is_sparse:
                             raise RuntimeError("Muon does not support sparse gradients")
-                    torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     if ns_steps == 0:
-                        ortho_updates = bucket["batch_buffer"]
-                    else:
-                        numel = bucket["batch_buffer"].numel()
-                        _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
-                            bucket["batch_buffer"],
-                            bucket["momentum_batch"],
-                            numel,
-                            momentum,
-                            nesterov=nesterov,
-                            BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
-                            num_warps=MUON_MOMENTUM_NUM_WARPS,
+                        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
+                        torch._foreach_add_(
+                            bucket["params"],
+                            bucket_grads,
+                            alpha=-bucket["adjusted_lr"],
                         )
-                        ortho_updates = _batched_zeropower_tensor(
-                            bucket["batch_buffer"],
-                            transposed=bucket["transposed"],
-                            ns_coefficients=ns_coefficients,
-                            ns_steps=ns_steps,
-                            eps=eps,
-                        )
+                        continue
+                    torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
+                    numel = bucket["batch_buffer"].numel()
+                    _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
+                        bucket["batch_buffer"],
+                        bucket["momentum_batch"],
+                        numel,
+                        momentum,
+                        nesterov=nesterov,
+                        BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
+                        num_warps=MUON_MOMENTUM_NUM_WARPS,
+                    )
+                    ortho_updates = _batched_zeropower_tensor(
+                        bucket["batch_buffer"],
+                        transposed=bucket["transposed"],
+                        ns_coefficients=ns_coefficients,
+                        ns_steps=ns_steps,
+                        eps=eps,
+                    )
                     if bucket["use_triton_weight_update"]:
                         if bucket["use_triton_weight_update_contig"]:
                             _fused_muon_weight_update_ptr_contig_kernel[
