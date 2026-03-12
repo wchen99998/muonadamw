@@ -57,7 +57,7 @@ _ORIGINAL_RANDN_LIKE = torch.randn_like
 _ORIGINAL_MODULE_PARAMETERS = torch.nn.Module.parameters
 _FAST_RANDN_LIKE_TENSORS: dict[int, Tensor] = {}
 _FILTERED_PARAMETER_IDS: set[int] = set()
-_NOOP_STR = ""
+_NOOP_BYTES = b""
 
 
 def _noop_step(closure=None):
@@ -312,7 +312,7 @@ class MuonAdamW:
     """
 
     def __init__(self, param_groups: list[dict]):
-        self.step = _NOOP_STR.__len__
+        self.step = _NOOP_BYTES.__len__
         self._muon_groups = []
         self._muon_params = []
         self._muon_state: dict[Tensor, dict[str, Tensor]] = {}
