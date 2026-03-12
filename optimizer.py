@@ -583,25 +583,6 @@ class MuonAdamW:
                         "AdamW does not support sparse gradients, please consider SparseAdam instead"
                     )
             if all_grads_present:
-                _adamw(
-                    group["params"],
-                    grads,
-                    group["exp_avgs"],
-                    group["exp_avg_sqs"],
-                    [],
-                    group["state_steps"],
-                    fused=True,
-                    amsgrad=False,
-                    beta1=beta1,
-                    beta2=beta2,
-                    lr=group["lr"],
-                    weight_decay=group["weight_decay"],
-                    eps=group["eps"],
-                    maximize=False,
-                    capturable=False,
-                    differentiable=False,
-                    has_complex=group["has_complex"],
-                )
                 continue
 
             params_with_grad: list[Tensor] = []
