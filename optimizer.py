@@ -351,7 +351,25 @@ class MuonAdamW:
                     "weight_decay": group.get("weight_decay", defaults["weight_decay"]),
                     "betas": group.get("betas", defaults.get("betas", (0.9, 0.999))),
                     "eps": group.get("eps", ADAMW_EPS),
+                    "has_complex": any(torch.is_complex(param) for param in params),
+                    "exp_avgs": [],
+                    "exp_avg_sqs": [],
+                    "state_steps": [],
                 }
+                for param in params:
+                    state = {
+                        "step": torch.zeros((), dtype=torch.float32, device=param.device),
+                        "exp_avg": torch.zeros_like(
+                            param, memory_format=torch.preserve_format
+                        ),
+                        "exp_avg_sq": torch.zeros_like(
+                            param, memory_format=torch.preserve_format
+                        ),
+                    }
+                    self._adamw_state[param] = state
+                    adamw_group["state_steps"].append(state["step"])
+                    adamw_group["exp_avgs"].append(state["exp_avg"])
+                    adamw_group["exp_avg_sqs"].append(state["exp_avg_sq"])
                 self._adamw_groups.append(adamw_group)
                 self._adamw_params.extend(params)
 
@@ -472,14 +490,45 @@ class MuonAdamW:
 
         for group in self._adamw_groups:
             beta1, beta2 = group["betas"]
+            if all(param.grad is not None for param in group["params"]):
+                grads = [param.grad for param in group["params"]]
+                if any(grad.is_sparse for grad in grads):
+                    raise RuntimeError(
+                        "AdamW does not support sparse gradients, please consider SparseAdam instead"
+                    )
+                _adamw(
+                    group["params"],
+                    grads,
+                    group["exp_avgs"],
+                    group["exp_avg_sqs"],
+                    [],
+                    group["state_steps"],
+                    fused=True,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                    capturable=False,
+                    differentiable=False,
+                    has_complex=group["has_complex"],
+                )
+                continue
+
             params_with_grad: list[Tensor] = []
             grads: list[Tensor] = []
             exp_avgs: list[Tensor] = []
             exp_avg_sqs: list[Tensor] = []
             state_steps: list[Tensor] = []
-            has_complex = False
 
-            for param in group["params"]:
+            for param, exp_avg, exp_avg_sq, state_step in zip(
+                group["params"],
+                group["exp_avgs"],
+                group["exp_avg_sqs"],
+                group["state_steps"],
+            ):
                 grad = param.grad
                 if grad is None:
                     continue
@@ -488,22 +537,11 @@ class MuonAdamW:
                         "AdamW does not support sparse gradients, please consider SparseAdam instead"
                     )
 
-                has_complex |= torch.is_complex(param)
-                state = self._adamw_state.setdefault(param, {})
-                if not state:
-                    state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
-                    state["exp_avg"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
-                    )
-                    state["exp_avg_sq"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
-                    )
-
                 params_with_grad.append(param)
                 grads.append(grad)
-                exp_avgs.append(state["exp_avg"])
-                exp_avg_sqs.append(state["exp_avg_sq"])
-                state_steps.append(state["step"])
+                exp_avgs.append(exp_avg)
+                exp_avg_sqs.append(exp_avg_sq)
+                state_steps.append(state_step)
 
             if params_with_grad:
                 _adamw(
@@ -523,7 +561,7 @@ class MuonAdamW:
                     maximize=False,
                     capturable=False,
                     differentiable=False,
-                    has_complex=has_complex,
+                    has_complex=group["has_complex"],
                 )
         return loss
 
