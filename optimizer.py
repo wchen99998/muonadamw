@@ -435,7 +435,7 @@ class MuonAdamW:
                 self._adamw_params.extend(params)
 
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self):
         """Perform a single optimization step."""
         return None
 
