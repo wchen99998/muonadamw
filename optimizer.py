@@ -288,6 +288,13 @@ class MuonAdamW:
                     "ns_steps": group.get("ns_steps", MUON_NS_STEPS),
                     "adjust_lr_fn": group.get("adjust_lr_fn"),
                 }
+                muon_group["weight_decay_factor"] = (
+                    1 - muon_group["lr"] * muon_group["weight_decay"]
+                )
+                muon_group["use_default_ns"] = (
+                    muon_group["ns_coefficients"] == MUON_NS_COEFFICIENTS
+                    and muon_group["ns_steps"] == MUON_NS_STEPS
+                )
                 shape_buckets = []
                 shape_to_bucket = {}
                 for idx, param in enumerate(params):
@@ -403,6 +410,8 @@ class MuonAdamW:
             eps = group["eps"]
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
+            weight_decay_factor = group["weight_decay_factor"]
+            use_default_ns = group["use_default_ns"]
             if all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
                     bucket_grads = [param.grad for param in bucket["params"]]
@@ -419,13 +428,18 @@ class MuonAdamW:
                         BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
                         num_warps=MUON_MOMENTUM_NUM_WARPS,
                     )
-                    ortho_updates = _batched_zeropower_tensor(
-                        bucket["batch_buffer"],
-                        transposed=bucket["transposed"],
-                        ns_coefficients=ns_coefficients,
-                        ns_steps=ns_steps,
-                        eps=eps,
-                    )
+                    if use_default_ns:
+                        ortho_updates = _batched_default_zeropower(
+                            bucket["batch_buffer"], bucket["transposed"], eps
+                        )
+                    else:
+                        ortho_updates = _batched_zeropower_tensor(
+                            bucket["batch_buffer"],
+                            transposed=bucket["transposed"],
+                            ns_coefficients=ns_coefficients,
+                            ns_steps=ns_steps,
+                            eps=eps,
+                        )
                     if bucket["use_triton_weight_update"]:
                         _fused_muon_weight_update_ptr_kernel[bucket["weight_update_grid"]](
                             bucket["param_ptrs"],
@@ -437,14 +451,14 @@ class MuonAdamW:
                             bucket["cols"],
                             bucket["param_stride0"],
                             bucket["param_stride1"],
-                            1 - lr * weight_decay,
+                            weight_decay_factor,
                             -bucket["adjusted_lr"],
                             BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
                             BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
                             num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
                         )
                     else:
-                        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
+                        torch._foreach_mul_(bucket["params"], weight_decay_factor)
                         torch._foreach_add_(
                             bucket["params"],
                             list(ortho_updates.unbind(0)),
@@ -492,7 +506,7 @@ class MuonAdamW:
                     eps=eps,
                 )
                 adjusted_lr = _adjust_muon_lr(lr, adjust_lr_fn, shape)
-                torch._foreach_mul_(params, 1 - lr * weight_decay)
+                torch._foreach_mul_(params, weight_decay_factor)
                 torch._foreach_add_(params, ortho_updates, alpha=-adjusted_lr)
 
         for group in self._adamw_groups:
