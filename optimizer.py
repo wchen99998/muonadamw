@@ -352,7 +352,7 @@ class MuonAdamW:
                         momentum,
                         nesterov=nesterov,
                         BLOCK_SIZE=1024,
-                        num_warps=8,
+                        num_warps=4,
                     )
                     ortho_updates = _batched_zeropower_tensor(
                         bucket["batch_buffer"],
