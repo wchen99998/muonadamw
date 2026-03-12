@@ -270,6 +270,72 @@ def _batched_zeropower_tensor(
     return ortho_grads
 
 
+def _run_muon_bucket_update(
+    bucket: dict,
+    momentum: float,
+    nesterov: bool,
+    lr: float,
+    weight_decay: float,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+) -> None:
+    numel = bucket["batch_buffer"].numel()
+    _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
+        bucket["batch_buffer"],
+        bucket["momentum_batch"],
+        numel,
+        momentum,
+        nesterov=nesterov,
+        BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
+        num_warps=MUON_MOMENTUM_NUM_WARPS,
+    )
+    ortho_updates = _batched_zeropower_tensor(
+        bucket["batch_buffer"],
+        transposed=bucket["transposed"],
+        ns_coefficients=ns_coefficients,
+        ns_steps=ns_steps,
+        eps=eps,
+    )
+    if bucket["use_triton_weight_update"]:
+        if bucket["use_triton_weight_update_contig"]:
+            _fused_muon_weight_update_ptr_contig_kernel[bucket["weight_update_grid"]](
+                bucket["param_ptrs"],
+                ortho_updates,
+                1 - lr * weight_decay,
+                -bucket["adjusted_lr"],
+                ROWS=bucket["rows"],
+                COLS=bucket["cols"],
+                BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
+                BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
+                num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
+            )
+        else:
+            _fused_muon_weight_update_ptr_kernel[bucket["weight_update_grid"]](
+                bucket["param_ptrs"],
+                ortho_updates,
+                ortho_updates.stride(0),
+                ortho_updates.stride(1),
+                ortho_updates.stride(2),
+                bucket["rows"],
+                bucket["cols"],
+                bucket["param_stride0"],
+                bucket["param_stride1"],
+                1 - lr * weight_decay,
+                -bucket["adjusted_lr"],
+                BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
+                BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
+                num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
+            )
+    else:
+        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
+        torch._foreach_add_(
+            bucket["params"],
+            list(ortho_updates.unbind(0)),
+            alpha=-bucket["adjusted_lr"],
+        )
+
+
 class MuonAdamW:
     """Combined Muon+AdamW optimizer.
 
@@ -379,6 +445,7 @@ class MuonAdamW:
                     bucket["momentum_views"] = [
                         momentum_batch[i] for i in range(momentum_batch.size(0))
                     ]
+                    bucket["cuda_graph"] = None
                     bucket["weight_update_grid"] = (
                         len(bucket["params"]),
                         triton.cdiv(bucket["rows"], MUON_WEIGHT_UPDATE_BLOCK_M),
@@ -392,6 +459,17 @@ class MuonAdamW:
                         )
                     for idx, buf in zip(bucket["indices"], bucket["momentum_views"]):
                         momentum_buffers[idx] = buf
+                    if (
+                        bucket["use_triton_weight_update"]
+                        and muon_group["ns_coefficients"] == MUON_NS_COEFFICIENTS
+                        and muon_group["ns_steps"] == MUON_NS_STEPS
+                    ):
+                        batch_buffer.zero_()
+                        _batched_default_zeropower(
+                            batch_buffer,
+                            bucket["transposed"],
+                            muon_group["eps"],
+                        )
                 muon_group["shape_buckets"] = shape_buckets
                 self._muon_groups.append(muon_group)
                 self._muon_params.extend(params)
@@ -455,64 +533,37 @@ class MuonAdamW:
                         if grad.is_sparse:
                             raise RuntimeError("Muon does not support sparse gradients")
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
-                    numel = bucket["batch_buffer"].numel()
-                    _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
-                        bucket["batch_buffer"],
-                        bucket["momentum_batch"],
-                        numel,
-                        momentum,
-                        nesterov=nesterov,
-                        BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
-                        num_warps=MUON_MOMENTUM_NUM_WARPS,
-                    )
-                    ortho_updates = _batched_zeropower_tensor(
-                        bucket["batch_buffer"],
-                        transposed=bucket["transposed"],
-                        ns_coefficients=ns_coefficients,
-                        ns_steps=ns_steps,
-                        eps=eps,
-                    )
-                    if bucket["use_triton_weight_update"]:
-                        if bucket["use_triton_weight_update_contig"]:
-                            _fused_muon_weight_update_ptr_contig_kernel[
-                                bucket["weight_update_grid"]
-                            ](
-                                bucket["param_ptrs"],
-                                ortho_updates,
-                                1 - lr * weight_decay,
-                                -bucket["adjusted_lr"],
-                                ROWS=bucket["rows"],
-                                COLS=bucket["cols"],
-                                BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
-                                BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
-                                num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
-                            )
-                        else:
-                            _fused_muon_weight_update_ptr_kernel[
-                                bucket["weight_update_grid"]
-                            ](
-                                bucket["param_ptrs"],
-                                ortho_updates,
-                                ortho_updates.stride(0),
-                                ortho_updates.stride(1),
-                                ortho_updates.stride(2),
-                                bucket["rows"],
-                                bucket["cols"],
-                                bucket["param_stride0"],
-                                bucket["param_stride1"],
-                                1 - lr * weight_decay,
-                                -bucket["adjusted_lr"],
-                                BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
-                                BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
-                                num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
-                            )
+                    if bucket["cuda_graph"] is not None:
+                        bucket["cuda_graph"].replay()
                     else:
-                        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
-                        torch._foreach_add_(
-                            bucket["params"],
-                            list(ortho_updates.unbind(0)),
-                            alpha=-bucket["adjusted_lr"],
-                        )
+                        if (
+                            bucket["use_triton_weight_update"]
+                            and ns_coefficients == MUON_NS_COEFFICIENTS
+                            and ns_steps == MUON_NS_STEPS
+                        ):
+                            bucket["cuda_graph"] = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(bucket["cuda_graph"]):
+                                _run_muon_bucket_update(
+                                    bucket,
+                                    momentum=momentum,
+                                    nesterov=nesterov,
+                                    lr=lr,
+                                    weight_decay=weight_decay,
+                                    ns_coefficients=ns_coefficients,
+                                    ns_steps=ns_steps,
+                                    eps=eps,
+                                )
+                        else:
+                            _run_muon_bucket_update(
+                                bucket,
+                                momentum=momentum,
+                                nesterov=nesterov,
+                                lr=lr,
+                                weight_decay=weight_decay,
+                                ns_coefficients=ns_coefficients,
+                                ns_steps=ns_steps,
+                                eps=eps,
+                            )
                 continue
 
             params_with_grad: list[Tensor] = []
