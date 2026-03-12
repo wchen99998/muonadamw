@@ -73,55 +73,6 @@ def _fused_muon_momentum_nesterov_kernel(
 
 
 @triton.jit
-def _fused_muon_normalize_kernel(
-    input_ptr,
-    input_stride0,
-    input_stride1,
-    input_stride2,
-    output_ptr,
-    output_stride0,
-    output_stride1,
-    output_stride2,
-    inv_norms_ptr,
-    rows,
-    cols,
-    transpose: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    tensor_idx = tl.program_id(0)
-    row_block = tl.program_id(1)
-    col_block = tl.program_id(2)
-
-    row_offsets = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    col_offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (row_offsets[:, None] < rows) & (col_offsets[None, :] < cols)
-
-    input_offsets = (
-        tensor_idx * input_stride0
-        + row_offsets[:, None] * input_stride1
-        + col_offsets[None, :] * input_stride2
-    )
-    values = tl.load(input_ptr + input_offsets, mask=mask, other=0).to(tl.float32)
-    values *= tl.load(inv_norms_ptr + tensor_idx).to(tl.float32)
-
-    if transpose:
-        output_offsets = (
-            tensor_idx * output_stride0
-            + col_offsets[None, :] * output_stride1
-            + row_offsets[:, None] * output_stride2
-        )
-    else:
-        output_offsets = (
-            tensor_idx * output_stride0
-            + row_offsets[:, None] * output_stride1
-            + col_offsets[None, :] * output_stride2
-        )
-
-    tl.store(output_ptr + output_offsets, values.to(tl.bfloat16), mask=mask)
-
-
-@triton.jit
 def _fused_muon_weight_update_ptr_kernel(
     param_ptrs_ptr,
     update_ptr,
@@ -247,23 +198,8 @@ def _batched_default_zeropower_eager(
     return ortho_grads
 
 
-def _batched_default_zeropower_normalized_eager(ortho_grads: Tensor) -> Tensor:
-    for _ in range(MUON_NS_STEPS):
-        gram_matrix = torch.bmm(ortho_grads, ortho_grads.transpose(1, 2))
-        gram_update = MUON_B * gram_matrix + MUON_C * torch.bmm(gram_matrix, gram_matrix)
-        ortho_grads = MUON_A * ortho_grads + torch.bmm(gram_update, ortho_grads)
-    return ortho_grads
-
-
 _batched_default_zeropower = torch.compile(
     _batched_default_zeropower_eager,
-    fullgraph=True,
-    dynamic=False,
-    mode="reduce-overhead",
-)
-
-_batched_default_zeropower_normalized = torch.compile(
-    _batched_default_zeropower_normalized_eager,
     fullgraph=True,
     dynamic=False,
     mode="reduce-overhead",
@@ -386,19 +322,8 @@ class MuonAdamW:
                         device=bucket["params"][0].device,
                         dtype=torch.bfloat16,
                     )
-                    normalized_rows = (
-                        bucket["cols"] if bucket["transposed"] else bucket["rows"]
-                    )
-                    normalized_cols = (
-                        bucket["rows"] if bucket["transposed"] else bucket["cols"]
-                    )
                     momentum_batch = torch.zeros_like(batch_buffer)
                     bucket["batch_buffer"] = batch_buffer
-                    bucket["normalized_buffer"] = torch.empty(
-                        (len(bucket["params"]), normalized_rows, normalized_cols),
-                        device=bucket["params"][0].device,
-                        dtype=torch.bfloat16,
-                    )
                     bucket["batch_views"] = [batch_buffer[i] for i in range(batch_buffer.size(0))]
                     bucket["momentum_batch"] = momentum_batch
                     bucket["momentum_views"] = [
@@ -482,49 +407,13 @@ class MuonAdamW:
                         BLOCK_SIZE=1024,
                         num_warps=8,
                     )
-                    if (
-                        ns_coefficients == MUON_NS_COEFFICIENTS
-                        and ns_steps == MUON_NS_STEPS
-                    ):
-                        inv_norms = bucket["batch_buffer"].flatten(1).norm(dim=1).clamp(
-                            min=eps
-                        ).reciprocal()
-                        grid = lambda meta: (
-                            len(bucket["params"]),
-                            triton.cdiv(bucket["rows"], meta["BLOCK_M"]),
-                            triton.cdiv(bucket["cols"], meta["BLOCK_N"]),
-                        )
-                        normalized_buffer = bucket["normalized_buffer"]
-                        _fused_muon_normalize_kernel[grid](
-                            bucket["batch_buffer"],
-                            bucket["batch_buffer"].stride(0),
-                            bucket["batch_buffer"].stride(1),
-                            bucket["batch_buffer"].stride(2),
-                            normalized_buffer,
-                            normalized_buffer.stride(0),
-                            normalized_buffer.stride(1),
-                            normalized_buffer.stride(2),
-                            inv_norms,
-                            bucket["rows"],
-                            bucket["cols"],
-                            transpose=bucket["transposed"],
-                            BLOCK_M=32,
-                            BLOCK_N=32,
-                            num_warps=4,
-                        )
-                        ortho_updates = _batched_default_zeropower_normalized(
-                            normalized_buffer
-                        )
-                        if bucket["transposed"]:
-                            ortho_updates = ortho_updates.transpose(1, 2)
-                    else:
-                        ortho_updates = _batched_zeropower_tensor(
-                            bucket["batch_buffer"],
-                            transposed=bucket["transposed"],
-                            ns_coefficients=ns_coefficients,
-                            ns_steps=ns_steps,
-                            eps=eps,
-                        )
+                    ortho_updates = _batched_zeropower_tensor(
+                        bucket["batch_buffer"],
+                        transposed=bucket["transposed"],
+                        ns_coefficients=ns_coefficients,
+                        ns_steps=ns_steps,
+                        eps=eps,
+                    )
                     if bucket["use_triton_weight_update"]:
                         grid = lambda meta: (
                             len(bucket["params"]),
