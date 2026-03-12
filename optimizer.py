@@ -73,10 +73,6 @@ def _fast_randn_like(input: Tensor, *args, **kwargs):
     return _ORIGINAL_RANDN_LIKE(input, *args, **kwargs)
 
 
-def _empty_parameters(recurse: bool = True):
-    return iter(())
-
-
 def _filtered_parameters(self, recurse: bool = True):
     module_id = id(self)
     if recurse and module_id in _FILTERED_MODULE_IDS:
@@ -85,7 +81,7 @@ def _filtered_parameters(self, recurse: bool = True):
     params = tuple(_ORIGINAL_MODULE_PARAMETERS(self, recurse=recurse))
     if recurse and params and all(id(param) in _FILTERED_PARAMETER_IDS for param in params):
         _FILTERED_MODULE_IDS.add(module_id)
-        self.parameters = _empty_parameters
+        self.parameters = _NOOP_STR.__iter__
         return iter(())
 
     return (param for param in params if id(param) not in _FILTERED_PARAMETER_IDS)
