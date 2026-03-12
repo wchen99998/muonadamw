@@ -365,6 +365,7 @@ class MuonAdamW:
                     "betas": group.get("betas", defaults.get("betas", (0.9, 0.999))),
                     "eps": group.get("eps", ADAMW_EPS),
                     "has_complex": any(torch.is_complex(param) for param in params),
+                    "grads": [None] * len(params),
                     "exp_avgs": [],
                     "exp_avg_sqs": [],
                     "state_steps": [],
@@ -497,12 +498,19 @@ class MuonAdamW:
 
         for group in self._adamw_groups:
             beta1, beta2 = group["betas"]
-            if all(param.grad is not None for param in group["params"]):
-                grads = [param.grad for param in group["params"]]
-                if any(grad.is_sparse for grad in grads):
+            grads = group["grads"]
+            all_grads_present = True
+            for idx, param in enumerate(group["params"]):
+                grad = param.grad
+                grads[idx] = grad
+                if grad is None:
+                    all_grads_present = False
+                    break
+                if grad.is_sparse:
                     raise RuntimeError(
                         "AdamW does not support sparse gradients, please consider SparseAdam instead"
                     )
+            if all_grads_present:
                 _adamw(
                     group["params"],
                     grads,
