@@ -309,6 +309,7 @@ class MuonAdamW:
                         raise RuntimeError("Muon does not support complex parameters")
                 muon_group = {
                     "params": params,
+                    "grads": [None] * len(params),
                     "lr": group.get("lr", defaults["lr"]),
                     "momentum": group.get("momentum", defaults["momentum"]),
                     "weight_decay": group.get("weight_decay", defaults["weight_decay"]),
@@ -450,27 +451,19 @@ class MuonAdamW:
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
             if ns_steps == 0:
+                group_grads = group["grads"]
                 all_grads_present = True
-                for bucket in group["shape_buckets"]:
-                    bucket_grads = bucket["grads"]
-                    for idx, param in enumerate(bucket["params"]):
-                        grad = param.grad
-                        if grad is None:
-                            all_grads_present = False
-                            break
-                        bucket_grads[idx] = grad
-                        if grad.is_sparse:
-                            raise RuntimeError("Muon does not support sparse gradients")
-                    if not all_grads_present:
+                for idx, param in enumerate(group["params"]):
+                    grad = param.grad
+                    if grad is None:
+                        all_grads_present = False
                         break
+                    group_grads[idx] = grad
+                    if grad.is_sparse:
+                        raise RuntimeError("Muon does not support sparse gradients")
                 if all_grads_present:
                     torch._foreach_mul_(group["params"], 1 - lr * weight_decay)
-                    for bucket in group["shape_buckets"]:
-                        torch._foreach_add_(
-                            bucket["params"],
-                            bucket["grads"],
-                            alpha=-bucket["adjusted_lr"],
-                        )
+                    torch._foreach_add_(group["params"], group_grads, alpha=-lr)
                     continue
             elif all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
