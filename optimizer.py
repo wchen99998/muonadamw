@@ -241,38 +241,6 @@ def _batched_zeropower_tensor(
     return ortho_grads
 
 
-def _fused_adamw_direct(
-    params: list[Tensor],
-    grads: list[Tensor],
-    exp_avgs: list[Tensor],
-    exp_avg_sqs: list[Tensor],
-    state_steps: list[Tensor],
-    beta1: float,
-    beta2: float,
-    lr: float,
-    weight_decay: float,
-    eps: float,
-) -> None:
-    torch._foreach_add_(state_steps, 1)
-    torch._fused_adamw_(
-        params,
-        grads,
-        exp_avgs,
-        exp_avg_sqs,
-        [],
-        state_steps,
-        amsgrad=False,
-        lr=lr,
-        beta1=beta1,
-        beta2=beta2,
-        weight_decay=weight_decay,
-        eps=eps,
-        maximize=False,
-        grad_scale=None,
-        found_inf=None,
-    )
-
-
 class MuonAdamW:
     """Combined Muon+AdamW optimizer.
 
@@ -399,10 +367,6 @@ class MuonAdamW:
                     "betas": group.get("betas", defaults.get("betas", (0.9, 0.999))),
                     "eps": group.get("eps", ADAMW_EPS),
                     "has_complex": any(torch.is_complex(param) for param in params),
-                    "use_direct_fused": (
-                        len({(param.device, param.dtype) for param in params}) == 1
-                        and not any(torch.is_complex(param) for param in params)
-                    ),
                     "grads": [None] * len(params),
                     "exp_avgs": [],
                     "exp_avg_sqs": [],
@@ -540,7 +504,6 @@ class MuonAdamW:
         for group in self._adamw_groups:
             beta1, beta2 = group["betas"]
             grads = group["grads"]
-            use_direct_fused = group["use_direct_fused"]
             all_grads_present = True
             for idx, param in enumerate(group["params"]):
                 grad = param.grad
@@ -553,39 +516,25 @@ class MuonAdamW:
                         "AdamW does not support sparse gradients, please consider SparseAdam instead"
                     )
             if all_grads_present:
-                if use_direct_fused:
-                    _fused_adamw_direct(
-                        group["params"],
-                        grads,
-                        group["exp_avgs"],
-                        group["exp_avg_sqs"],
-                        group["state_steps"],
-                        beta1=beta1,
-                        beta2=beta2,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                    )
-                else:
-                    _adamw(
-                        group["params"],
-                        grads,
-                        group["exp_avgs"],
-                        group["exp_avg_sqs"],
-                        [],
-                        group["state_steps"],
-                        fused=True,
-                        amsgrad=False,
-                        beta1=beta1,
-                        beta2=beta2,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                        maximize=False,
-                        capturable=False,
-                        differentiable=False,
-                        has_complex=group["has_complex"],
-                    )
+                _adamw(
+                    group["params"],
+                    grads,
+                    group["exp_avgs"],
+                    group["exp_avg_sqs"],
+                    [],
+                    group["state_steps"],
+                    fused=True,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                    capturable=False,
+                    differentiable=False,
+                    has_complex=group["has_complex"],
+                )
                 continue
 
             params_with_grad: list[Tensor] = []
@@ -615,39 +564,25 @@ class MuonAdamW:
                 state_steps.append(state_step)
 
             if params_with_grad:
-                if use_direct_fused:
-                    _fused_adamw_direct(
-                        params_with_grad,
-                        grads,
-                        exp_avgs,
-                        exp_avg_sqs,
-                        state_steps,
-                        beta1=beta1,
-                        beta2=beta2,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                    )
-                else:
-                    _adamw(
-                        params_with_grad,
-                        grads,
-                        exp_avgs,
-                        exp_avg_sqs,
-                        [],
-                        state_steps,
-                        fused=True,
-                        amsgrad=False,
-                        beta1=beta1,
-                        beta2=beta2,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                        maximize=False,
-                        capturable=False,
-                        differentiable=False,
-                        has_complex=group["has_complex"],
-                    )
+                _adamw(
+                    params_with_grad,
+                    grads,
+                    exp_avgs,
+                    exp_avg_sqs,
+                    [],
+                    state_steps,
+                    fused=True,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                    capturable=False,
+                    differentiable=False,
+                    has_complex=group["has_complex"],
+                )
         return loss
 
     def zero_grad(self, set_to_none: bool = True):
