@@ -247,6 +247,9 @@ def _batched_zeropower_tensor(
     ns_steps: int,
     eps: float,
 ) -> Tensor:
+    if ns_steps == 0:
+        return ortho_grads
+
     if (
         ns_coefficients == MUON_NS_COEFFICIENTS
         and ns_steps == MUON_NS_STEPS
