@@ -117,6 +117,35 @@ def _fused_muon_weight_update_ptr_kernel(
     tl.store(param_ptr + param_offsets, param.to(tl.bfloat16), mask=mask)
 
 
+@triton.jit
+def _fused_muon_weight_update_ptr_contig_kernel(
+    param_ptrs_ptr,
+    update_ptr,
+    wd_factor,
+    neg_lr,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tensor_idx = tl.program_id(0)
+    row_block = tl.program_id(1)
+    col_block = tl.program_id(2)
+
+    row_offsets = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (row_offsets[:, None] < ROWS) & (col_offsets[None, :] < COLS)
+
+    param_ptr = tl.load(param_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
+    offsets = row_offsets[:, None] * COLS + col_offsets[None, :]
+    update_ptr = update_ptr + tensor_idx * ROWS * COLS
+
+    param = tl.load(param_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    update = tl.load(update_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    param = wd_factor * param + neg_lr * update
+    tl.store(param_ptr + offsets, param.to(tl.bfloat16), mask=mask)
+
+
 def _zeropower_via_newtonschulz(
     grad: Tensor,
     ns_coefficients: tuple[float, float, float],
@@ -309,6 +338,11 @@ class MuonAdamW:
                             "param_stride1": param_stride1,
                             "transposed": param.size(0) > param.size(1),
                             "use_triton_weight_update": param.dtype is torch.bfloat16,
+                            "use_triton_weight_update_contig": (
+                                param.dtype is torch.bfloat16
+                                and param.is_contiguous()
+                                and param.size(0) <= param.size(1)
+                            ),
                         }
                         shape_to_bucket[param.shape] = bucket
                         shape_buckets.append(bucket)
@@ -318,6 +352,12 @@ class MuonAdamW:
                         or param.dtype is not torch.bfloat16
                     ):
                         bucket["use_triton_weight_update"] = False
+                    if (
+                        not param.is_contiguous()
+                        or param.size(0) > param.size(1)
+                        or param.dtype is not torch.bfloat16
+                    ):
+                        bucket["use_triton_weight_update_contig"] = False
                     bucket["indices"].append(idx)
                     bucket["params"].append(param)
 
@@ -433,22 +473,39 @@ class MuonAdamW:
                         eps=eps,
                     )
                     if bucket["use_triton_weight_update"]:
-                        _fused_muon_weight_update_ptr_kernel[bucket["weight_update_grid"]](
-                            bucket["param_ptrs"],
-                            ortho_updates,
-                            ortho_updates.stride(0),
-                            ortho_updates.stride(1),
-                            ortho_updates.stride(2),
-                            bucket["rows"],
-                            bucket["cols"],
-                            bucket["param_stride0"],
-                            bucket["param_stride1"],
-                            1 - lr * weight_decay,
-                            -bucket["adjusted_lr"],
-                            BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
-                            BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
-                            num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
-                        )
+                        if bucket["use_triton_weight_update_contig"]:
+                            _fused_muon_weight_update_ptr_contig_kernel[
+                                bucket["weight_update_grid"]
+                            ](
+                                bucket["param_ptrs"],
+                                ortho_updates,
+                                1 - lr * weight_decay,
+                                -bucket["adjusted_lr"],
+                                ROWS=bucket["rows"],
+                                COLS=bucket["cols"],
+                                BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
+                                BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
+                                num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
+                            )
+                        else:
+                            _fused_muon_weight_update_ptr_kernel[
+                                bucket["weight_update_grid"]
+                            ](
+                                bucket["param_ptrs"],
+                                ortho_updates,
+                                ortho_updates.stride(0),
+                                ortho_updates.stride(1),
+                                ortho_updates.stride(2),
+                                bucket["rows"],
+                                bucket["cols"],
+                                bucket["param_stride0"],
+                                bucket["param_stride1"],
+                                1 - lr * weight_decay,
+                                -bucket["adjusted_lr"],
+                                BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
+                                BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
+                                num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
+                            )
                     else:
                         torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
                         torch._foreach_add_(
