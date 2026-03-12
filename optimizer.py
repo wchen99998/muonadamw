@@ -190,9 +190,7 @@ def _batched_default_zeropower_eager(
     if transposed:
         ortho_grads = ortho_grads.transpose(1, 2)
 
-    norms = torch.linalg.vector_norm(ortho_grads, dim=(1, 2)).clamp(min=eps).view(
-        -1, 1, 1
-    )
+    norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
     ortho_grads = ortho_grads / norms
 
     for _ in range(MUON_NS_STEPS):
@@ -230,9 +228,7 @@ def _batched_zeropower_tensor(
     if transposed:
         ortho_grads = ortho_grads.transpose(1, 2)
 
-    norms = torch.linalg.vector_norm(ortho_grads, dim=(1, 2)).clamp(min=eps).view(
-        -1, 1, 1
-    )
+    norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
     ortho_grads = ortho_grads / norms
 
     for _ in range(ns_steps):
