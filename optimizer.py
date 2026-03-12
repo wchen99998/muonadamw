@@ -53,8 +53,6 @@ MUON_WEIGHT_UPDATE_BLOCK_M = 32
 MUON_WEIGHT_UPDATE_BLOCK_N = 64
 MUON_WEIGHT_UPDATE_NUM_WARPS = 4
 ADAMW_EPS = 1e-8
-ADAMW_BLOCK_SIZE = 1024
-ADAMW_NUM_WARPS = 8
 
 
 @triton.jit
@@ -77,52 +75,6 @@ def _fused_muon_momentum_nesterov_kernel(
 
     tl.store(momentum_ptr + offsets, buf.to(tl.bfloat16), mask=mask)
     tl.store(grad_ptr + offsets, update.to(tl.bfloat16), mask=mask)
-
-
-@triton.jit
-def _fused_adamw_ptr_kernel(
-    param_ptrs_ptr,
-    grad_ptrs_ptr,
-    exp_avg_ptrs_ptr,
-    exp_avg_sq_ptrs_ptr,
-    numels_ptr,
-    wd_factor,
-    step_size,
-    inv_bias_correction2_sqrt,
-    beta1,
-    beta2,
-    one_minus_beta1,
-    one_minus_beta2,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
-):
-    tensor_idx = tl.program_id(0)
-    block_idx = tl.program_id(1)
-
-    numel = tl.load(numels_ptr + tensor_idx)
-    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < numel
-
-    param_ptr = tl.load(param_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
-    grad_ptr = tl.load(grad_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
-    exp_avg_ptr = tl.load(exp_avg_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
-    exp_avg_sq_ptr = tl.load(exp_avg_sq_ptrs_ptr + tensor_idx).to(
-        tl.pointer_type(tl.bfloat16)
-    )
-
-    param = tl.load(param_ptr + offsets, mask=mask, other=0).to(tl.float32)
-    grad = tl.load(grad_ptr + offsets, mask=mask, other=0).to(tl.float32)
-    exp_avg = tl.load(exp_avg_ptr + offsets, mask=mask, other=0).to(tl.float32)
-    exp_avg_sq = tl.load(exp_avg_sq_ptr + offsets, mask=mask, other=0).to(tl.float32)
-
-    exp_avg = beta1 * exp_avg + one_minus_beta1 * grad
-    exp_avg_sq = beta2 * exp_avg_sq + one_minus_beta2 * grad * grad
-    denom = tl.sqrt(exp_avg_sq) * inv_bias_correction2_sqrt + eps
-    param = wd_factor * param + step_size * (exp_avg / denom)
-
-    tl.store(param_ptr + offsets, param.to(tl.bfloat16), mask=mask)
-    tl.store(exp_avg_ptr + offsets, exp_avg.to(tl.bfloat16), mask=mask)
-    tl.store(exp_avg_sq_ptr + offsets, exp_avg_sq.to(tl.bfloat16), mask=mask)
 
 
 @triton.jit
@@ -459,16 +411,6 @@ class MuonAdamW:
                     "exp_avgs": [],
                     "exp_avg_sqs": [],
                     "state_steps": [],
-                    "triton_2d_buckets": [],
-                    "triton_2d_step": 0,
-                    "triton_remainder": {
-                        "indices": [],
-                        "params": [],
-                        "grads": [],
-                        "exp_avgs": [],
-                        "exp_avg_sqs": [],
-                        "state_steps": [],
-                    },
                 }
                 for param in params:
                     state = {
@@ -484,79 +426,6 @@ class MuonAdamW:
                     adamw_group["state_steps"].append(state["step"])
                     adamw_group["exp_avgs"].append(state["exp_avg"])
                     adamw_group["exp_avg_sqs"].append(state["exp_avg_sq"])
-                triton_bucket_by_shape = {}
-                for idx, (param, exp_avg, exp_avg_sq, state_step) in enumerate(
-                    zip(
-                        params,
-                        adamw_group["exp_avgs"],
-                        adamw_group["exp_avg_sqs"],
-                        adamw_group["state_steps"],
-                    )
-                ):
-                    if (
-                        param.ndim == 2
-                        and param.dtype is torch.bfloat16
-                        and param.is_contiguous()
-                        and not adamw_group["has_complex"]
-                    ):
-                        bucket = triton_bucket_by_shape.get(param.shape)
-                        if bucket is None:
-                            bucket = {
-                                "indices": [],
-                                "params": [],
-                                "grads": [],
-                                "exp_avgs": [],
-                                "exp_avg_sqs": [],
-                                "state_steps": [],
-                            }
-                            triton_bucket_by_shape[param.shape] = bucket
-                            adamw_group["triton_2d_buckets"].append(bucket)
-                        bucket["indices"].append(idx)
-                        bucket["params"].append(param)
-                        bucket["grads"].append(None)
-                        bucket["exp_avgs"].append(exp_avg)
-                        bucket["exp_avg_sqs"].append(exp_avg_sq)
-                        bucket["state_steps"].append(state_step)
-                    else:
-                        remainder = adamw_group["triton_remainder"]
-                        remainder["indices"].append(idx)
-                        remainder["params"].append(param)
-                        remainder["grads"].append(None)
-                        remainder["exp_avgs"].append(exp_avg)
-                        remainder["exp_avg_sqs"].append(exp_avg_sq)
-                        remainder["state_steps"].append(state_step)
-                for bucket in adamw_group["triton_2d_buckets"]:
-                    numel = bucket["params"][0].numel()
-                    bucket["numels"] = torch.full(
-                        (len(bucket["params"]),),
-                        numel,
-                        device=bucket["params"][0].device,
-                        dtype=torch.int32,
-                    )
-                    bucket["param_ptrs"] = torch.tensor(
-                        [param.data_ptr() for param in bucket["params"]],
-                        device=bucket["params"][0].device,
-                        dtype=torch.int64,
-                    )
-                    bucket["exp_avg_ptrs"] = torch.tensor(
-                        [exp_avg.data_ptr() for exp_avg in bucket["exp_avgs"]],
-                        device=bucket["params"][0].device,
-                        dtype=torch.int64,
-                    )
-                    bucket["exp_avg_sq_ptrs"] = torch.tensor(
-                        [exp_avg_sq.data_ptr() for exp_avg_sq in bucket["exp_avg_sqs"]],
-                        device=bucket["params"][0].device,
-                        dtype=torch.int64,
-                    )
-                    bucket["grad_ptrs"] = torch.empty(
-                        len(bucket["params"]),
-                        device=bucket["params"][0].device,
-                        dtype=torch.int64,
-                    )
-                    bucket["adamw_grid"] = (
-                        len(bucket["params"]),
-                        triton.cdiv(numel, ADAMW_BLOCK_SIZE),
-                    )
                 self._adamw_groups.append(adamw_group)
                 self._adamw_params.extend(params)
 
@@ -704,84 +573,27 @@ class MuonAdamW:
                         "AdamW does not support sparse gradients, please consider SparseAdam instead"
                     )
             if all_grads_present:
-                if group["triton_2d_buckets"] and group["triton_2d_step"] is not None:
-                    group["triton_2d_step"] += 1
-                    step = group["triton_2d_step"]
-                    wd_factor = 1 - group["lr"] * group["weight_decay"]
-                    step_size = -group["lr"] / (1 - beta1**step)
-                    inv_bias_correction2_sqrt = 1.0 / math.sqrt(1 - beta2**step)
-                    for bucket in group["triton_2d_buckets"]:
-                        grad_ptrs = torch.tensor(
-                            [grads[idx].data_ptr() for idx in bucket["indices"]],
-                            device=bucket["grad_ptrs"].device,
-                            dtype=torch.int64,
-                        )
-                        bucket["grad_ptrs"].copy_(grad_ptrs)
-                        torch._foreach_add_(bucket["state_steps"], 1)
-                        _fused_adamw_ptr_kernel[bucket["adamw_grid"]](
-                            bucket["param_ptrs"],
-                            bucket["grad_ptrs"],
-                            bucket["exp_avg_ptrs"],
-                            bucket["exp_avg_sq_ptrs"],
-                            bucket["numels"],
-                            wd_factor,
-                            step_size,
-                            inv_bias_correction2_sqrt,
-                            beta1,
-                            beta2,
-                            1 - beta1,
-                            1 - beta2,
-                            group["eps"],
-                            BLOCK_SIZE=ADAMW_BLOCK_SIZE,
-                            num_warps=ADAMW_NUM_WARPS,
-                        )
-                    remainder = group["triton_remainder"]
-                    if remainder["params"]:
-                        for out_idx, param_idx in enumerate(remainder["indices"]):
-                            remainder["grads"][out_idx] = grads[param_idx]
-                        _adamw(
-                            remainder["params"],
-                            remainder["grads"],
-                            remainder["exp_avgs"],
-                            remainder["exp_avg_sqs"],
-                            [],
-                            remainder["state_steps"],
-                            fused=True,
-                            amsgrad=False,
-                            beta1=beta1,
-                            beta2=beta2,
-                            lr=group["lr"],
-                            weight_decay=group["weight_decay"],
-                            eps=group["eps"],
-                            maximize=False,
-                            capturable=False,
-                            differentiable=False,
-                            has_complex=False,
-                        )
-                else:
-                    _adamw(
-                        group["params"],
-                        grads,
-                        group["exp_avgs"],
-                        group["exp_avg_sqs"],
-                        [],
-                        group["state_steps"],
-                        fused=True,
-                        amsgrad=False,
-                        beta1=beta1,
-                        beta2=beta2,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                        maximize=False,
-                        capturable=False,
-                        differentiable=False,
-                        has_complex=group["has_complex"],
-                    )
+                _adamw(
+                    group["params"],
+                    grads,
+                    group["exp_avgs"],
+                    group["exp_avg_sqs"],
+                    [],
+                    group["state_steps"],
+                    fused=True,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                    capturable=False,
+                    differentiable=False,
+                    has_complex=group["has_complex"],
+                )
                 continue
 
-            if group["triton_2d_buckets"]:
-                group["triton_2d_step"] = None
             params_with_grad: list[Tensor] = []
             grads: list[Tensor] = []
             exp_avgs: list[Tensor] = []
