@@ -96,6 +96,9 @@ FOREVER:
 5. **Triton fused weight update**
    Replace `foreach_mul_` + `foreach_add_` with `param = wd_factor * param + neg_lr * update`.
 
+5a. **Triton targets and Triton autotuning **
+   Other triton targets
+   
 6. **Cross-group batching**
    Merge attn_2d and ffn_2d Muon groups where they share shapes, process in single batch.
 
