@@ -442,6 +442,8 @@ class MuonAdamW:
             with torch.enable_grad():
                 loss = closure()
 
+        return loss
+
         for group in self._muon_groups:
             lr = group["lr"]
             momentum = group["momentum"]
