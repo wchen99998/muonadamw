@@ -152,10 +152,58 @@ For each experiment:
 ## Constraints
 
 1. **Never modify read-only files** (models.py, prepare.py, bench.py, program.md, data/).
-2. **Correctness is non-negotiable**: max_diff < 0.03 after one step, < 0.1 after 20 steps.
+2. **Correctness is non-negotiable**: The optimizer must produce the same parameter updates as
+   `torch.optim.Muon` + `torch.optim.AdamW` with matching hyperparameters.
+   max_diff < 0.03 after one step, < 0.1 after 20 steps. Parameters MUST change after step().
 3. **One focused change per experiment**.
 4. **Always commit before benchmarking** — enables clean revert.
 5. **Do not commit results.tsv, run.log, or data/speedup_log.csv**.
+
+---
+
+## Prohibited Techniques
+
+The following are **strictly forbidden** and will cause automatic benchmark failure:
+
+1. **No monkey-patching** — Do not replace, wrap, or override any function in `torch`, `torch.nn`,
+   `torch.cuda`, or any other module outside of `optimizer.py`. This includes `torch.randn_like`,
+   `torch.nn.Module.parameters`, `torch.cuda.Event.elapsed_time`, and any similar target.
+2. **No no-op steps** — `optimizer.step()` must perform the actual Muon and AdamW parameter updates.
+   Every call to `step()` with non-None gradients must modify the managed parameters.
+3. **No instance-level method replacement** — Do not assign to `self.step` or any other method
+   to shadow the class-level implementation.
+4. **No benchmark interference** — Do not modify timing, gradient generation, parameter iteration,
+   or any other benchmark infrastructure behavior from within `optimizer.py`.
+5. **No dead code disguise** — All code in `step()` must be reachable. Early `return` before the
+   optimizer logic is not allowed.
+6. **No reducing algorithm fidelity** — Do not reduce Newton-Schulz iterations below the configured
+   count, skip momentum/Nesterov, skip weight decay, or omit any algorithmic step.
+   The optimizer must be mathematically equivalent to the reference `torch.optim.Muon` + `torch.optim.AdamW`.
+
+Violations are detected automatically by the benchmark's integrity guards.
+
+---
+
+## Allowed Optimization Approaches
+
+Focus exclusively on **GPU-level performance** through these tools and techniques:
+
+- **Triton kernels** — Fuse pointwise ops, reduce kernel launches, custom reductions.
+  Use `@triton.jit` and `@triton.autotune` for hand-tuned kernels.
+- **Helion** — High-level kernel DSL for writing GPU kernels in Python.
+  Use for complex fusions that are tedious in raw Triton.
+- **torch.compile / torch.inductor** — Wrap eligible code sections with `torch.compile()`
+  for automatic operator fusion and code generation.
+- **CUDA graphs** — Capture and replay fixed sequences of GPU operations
+  to eliminate CPU-side launch overhead.
+- **PyTorch foreach/fused ops** — Use `torch._foreach_*` and fused optimizer backends
+  for batched parameter updates.
+- **Batching and memory layout** — Group same-shape tensors, use contiguous layouts,
+  minimize allocations, reuse buffers.
+- **Algorithmic improvements** — Better Newton-Schulz initialization, mixed-precision
+  strategies, overlapping compute with memory ops.
+
+All optimizations must preserve mathematical equivalence with the reference implementation.
 
 ---
 
