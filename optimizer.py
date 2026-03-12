@@ -146,35 +146,6 @@ def _fused_muon_weight_update_ptr_contig_kernel(
     tl.store(param_ptr + offsets, param.to(tl.bfloat16), mask=mask)
 
 
-@triton.jit
-def _fused_muon_direct_grad_update_ptr_contig_kernel(
-    param_ptrs_ptr,
-    grad_ptrs_ptr,
-    wd_factor,
-    neg_lr,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    tensor_idx = tl.program_id(0)
-    row_block = tl.program_id(1)
-    col_block = tl.program_id(2)
-
-    row_offsets = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    col_offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (row_offsets[:, None] < ROWS) & (col_offsets[None, :] < COLS)
-
-    param_ptr = tl.load(param_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
-    grad_ptr = tl.load(grad_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
-    offsets = row_offsets[:, None] * COLS + col_offsets[None, :]
-
-    param = tl.load(param_ptr + offsets, mask=mask, other=0).to(tl.float32)
-    grad = tl.load(grad_ptr + offsets, mask=mask, other=0).to(tl.float32)
-    param = wd_factor * param + neg_lr * grad
-    tl.store(param_ptr + offsets, param.to(tl.bfloat16), mask=mask)
-
-
 def _zeropower_via_newtonschulz(
     grad: Tensor,
     ns_coefficients: tuple[float, float, float],
@@ -375,9 +346,6 @@ class MuonAdamW:
                                 and param.is_contiguous()
                                 and param.size(0) <= param.size(1)
                             ),
-                            "use_triton_direct_grad_update_contig": (
-                                param.dtype is torch.bfloat16 and param.is_contiguous()
-                            ),
                         }
                         shape_to_bucket[param.shape] = bucket
                         shape_buckets.append(bucket)
@@ -393,8 +361,6 @@ class MuonAdamW:
                         or param.dtype is not torch.bfloat16
                     ):
                         bucket["use_triton_weight_update_contig"] = False
-                    if not param.is_contiguous() or param.dtype is not torch.bfloat16:
-                        bucket["use_triton_direct_grad_update_contig"] = False
                     bucket["indices"].append(idx)
                     bucket["params"].append(param)
 
@@ -424,12 +390,6 @@ class MuonAdamW:
                     if bucket["use_triton_weight_update"]:
                         bucket["param_ptrs"] = torch.tensor(
                             [param.data_ptr() for param in bucket["params"]],
-                            device=bucket["params"][0].device,
-                            dtype=torch.int64,
-                        )
-                    if bucket["use_triton_direct_grad_update_contig"]:
-                        bucket["grad_ptrs"] = torch.empty(
-                            len(bucket["params"]),
                             device=bucket["params"][0].device,
                             dtype=torch.int64,
                         )
@@ -492,42 +452,18 @@ class MuonAdamW:
             if all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
                     bucket_grads = bucket["grads"]
-                    use_triton_direct_grad = ns_steps == 0 and bucket[
-                        "use_triton_direct_grad_update_contig"
-                    ]
-                    grad_ptrs = bucket.get("grad_ptrs")
                     for idx, param in enumerate(bucket["params"]):
                         grad = param.grad
                         bucket_grads[idx] = grad
                         if grad.is_sparse:
                             raise RuntimeError("Muon does not support sparse gradients")
-                        if use_triton_direct_grad:
-                            if grad.dtype is not torch.bfloat16 or not grad.is_contiguous():
-                                use_triton_direct_grad = False
-                            else:
-                                grad_ptrs[idx] = grad.data_ptr()
                     if ns_steps == 0:
-                        if use_triton_direct_grad:
-                            _fused_muon_direct_grad_update_ptr_contig_kernel[
-                                bucket["weight_update_grid"]
-                            ](
-                                bucket["param_ptrs"],
-                                grad_ptrs,
-                                1 - lr * weight_decay,
-                                -bucket["adjusted_lr"],
-                                ROWS=bucket["rows"],
-                                COLS=bucket["cols"],
-                                BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
-                                BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
-                                num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
-                            )
-                        else:
-                            torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
-                            torch._foreach_add_(
-                                bucket["params"],
-                                bucket_grads,
-                                alpha=-bucket["adjusted_lr"],
-                            )
+                        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
+                        torch._foreach_add_(
+                            bucket["params"],
+                            bucket_grads,
+                            alpha=-bucket["adjusted_lr"],
+                        )
                         continue
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     numel = bucket["batch_buffer"].numel()
