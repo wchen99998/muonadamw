@@ -450,6 +450,22 @@ class MuonAdamW:
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
             if all(param.grad is not None for param in group["params"]):
+                if ns_steps == 0:
+                    for bucket in group["shape_buckets"]:
+                        bucket_grads = bucket["grads"]
+                        for idx, param in enumerate(bucket["params"]):
+                            grad = param.grad
+                            bucket_grads[idx] = grad
+                            if grad.is_sparse:
+                                raise RuntimeError("Muon does not support sparse gradients")
+                    torch._foreach_mul_(group["params"], 1 - lr * weight_decay)
+                    for bucket in group["shape_buckets"]:
+                        torch._foreach_add_(
+                            bucket["params"],
+                            bucket["grads"],
+                            alpha=-bucket["adjusted_lr"],
+                        )
+                    continue
                 for bucket in group["shape_buckets"]:
                     bucket_grads = bucket["grads"]
                     for idx, param in enumerate(bucket["params"]):
@@ -457,14 +473,6 @@ class MuonAdamW:
                         bucket_grads[idx] = grad
                         if grad.is_sparse:
                             raise RuntimeError("Muon does not support sparse gradients")
-                    if ns_steps == 0:
-                        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
-                        torch._foreach_add_(
-                            bucket["params"],
-                            bucket_grads,
-                            alpha=-bucket["adjusted_lr"],
-                        )
-                        continue
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     numel = bucket["batch_buffer"].numel()
                     _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
