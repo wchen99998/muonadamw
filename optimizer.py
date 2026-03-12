@@ -187,20 +187,22 @@ def _batched_default_zeropower_eager(
     transposed: bool,
     eps: float,
 ) -> Tensor:
+    result = ortho_grads
     if transposed:
         ortho_grads = ortho_grads.transpose(1, 2)
 
     norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
-    ortho_grads = ortho_grads / norms
+    ortho_grads.div_(norms)
 
     for _ in range(MUON_NS_STEPS):
         gram_matrix = torch.bmm(ortho_grads, ortho_grads.transpose(1, 2))
-        gram_update = MUON_B * gram_matrix + MUON_C * torch.bmm(gram_matrix, gram_matrix)
-        ortho_grads = MUON_A * ortho_grads + torch.bmm(gram_update, ortho_grads)
+        gram_update = torch.bmm(gram_matrix, gram_matrix)
+        gram_update.mul_(MUON_C).add_(gram_matrix, alpha=MUON_B)
+        next_ortho = torch.bmm(gram_update, ortho_grads)
+        next_ortho.add_(ortho_grads, alpha=MUON_A)
+        ortho_grads.copy_(next_ortho)
 
-    if transposed:
-        ortho_grads = ortho_grads.transpose(1, 2)
-    return ortho_grads
+    return result
 
 
 _batched_default_zeropower = torch.compile(
