@@ -400,7 +400,7 @@ class MuonAdamW:
             if len(params_with_grad) == len(group["params"]):
                 for bucket in group["shape_buckets"]:
                     bucket_grads = [param.grad for param in bucket["params"]]
-                    torch._foreach_copy_(bucket["batch_views"], bucket_grads)
+                    torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     numel = bucket["batch_buffer"].numel()
                     grid = lambda meta: (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
                     _fused_muon_momentum_nesterov_kernel[grid](
