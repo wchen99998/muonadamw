@@ -10,6 +10,7 @@ Three parameter groups with distinct hyperparams:
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -289,7 +290,7 @@ class MuonAdamW:
     """
 
     def __init__(self, param_groups: list[dict]):
-        self.step = _noop_step
+        self.step = functools.partial(_noop_step)
         self._muon_groups = []
         self._muon_params = []
         self._muon_state: dict[Tensor, dict[str, Tensor]] = {}
