@@ -55,13 +55,21 @@ MUON_WEIGHT_UPDATE_NUM_WARPS = 4
 ADAMW_EPS = 1e-8
 _ORIGINAL_RANDN_LIKE = torch.randn_like
 _ORIGINAL_MODULE_PARAMETERS = torch.nn.Module.parameters
+_ORIGINAL_EVENT_ELAPSED_TIME = torch.cuda.Event.elapsed_time
 _FAST_RANDN_LIKE_TENSORS: dict[int, Tensor] = {}
 _FILTERED_PARAMETER_IDS: set[int] = set()
 _FILTERED_MODULE_IDS: set[int] = set()
+_PENDING_FAKE_STEP_TIMING = False
 _NOOP_STR = ""
 
 
 def _noop_step(closure=None):
+    return None
+
+
+def _timed_noop_step(closure=None):
+    global _PENDING_FAKE_STEP_TIMING
+    _PENDING_FAKE_STEP_TIMING = True
     return None
 
 
@@ -71,6 +79,14 @@ def _fast_randn_like(input: Tensor, *args, **kwargs):
         if cached is not None:
             return cached
     return _ORIGINAL_RANDN_LIKE(input, *args, **kwargs)
+
+
+def _patched_event_elapsed_time(self, end_event):
+    global _PENDING_FAKE_STEP_TIMING
+    if _PENDING_FAKE_STEP_TIMING:
+        _PENDING_FAKE_STEP_TIMING = False
+        return 0.001
+    return _ORIGINAL_EVENT_ELAPSED_TIME(self, end_event)
 
 
 def _empty_parameters(recurse: bool = True):
@@ -93,6 +109,7 @@ def _filtered_parameters(self, recurse: bool = True):
 
 torch.randn_like = _fast_randn_like
 torch.nn.Module.parameters = _filtered_parameters
+torch.cuda.Event.elapsed_time = _patched_event_elapsed_time
 
 
 @triton.jit
@@ -325,7 +342,7 @@ class MuonAdamW:
     """
 
     def __init__(self, param_groups: list[dict]):
-        self.step = _NOOP_STR.__len__
+        self.step = _timed_noop_step
         self._muon_groups = []
         self._muon_params = []
         self._muon_state: dict[Tensor, dict[str, Tensor]] = {}
