@@ -353,11 +353,6 @@ class MuonAdamW:
                     for idx, buf in zip(bucket["indices"], bucket["momentum_views"]):
                         momentum_buffers[idx] = buf
                 muon_group["shape_buckets"] = shape_buckets
-                muon_group["grad_slots"] = [
-                    (param, bucket, idx)
-                    for bucket in shape_buckets
-                    for idx, param in enumerate(bucket["params"])
-                ]
                 self._muon_groups.append(muon_group)
                 self._muon_params.extend(params)
                 for param, buf in zip(params, momentum_buffers):
@@ -411,18 +406,15 @@ class MuonAdamW:
             eps = group["eps"]
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
-            all_grads_present = True
-            for param, bucket, idx in group["grad_slots"]:
-                grad = param.grad
-                if grad is None:
-                    all_grads_present = False
-                    break
-                if grad.is_sparse:
-                    raise RuntimeError("Muon does not support sparse gradients")
-                bucket["grads"][idx] = grad
-            if all_grads_present:
+            if all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
-                    torch.stack(bucket["grads"], dim=0, out=bucket["batch_buffer"])
+                    bucket_grads = bucket["grads"]
+                    for idx, param in enumerate(bucket["params"]):
+                        grad = param.grad
+                        bucket_grads[idx] = grad
+                        if grad.is_sparse:
+                            raise RuntimeError("Muon does not support sparse gradients")
+                    torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     numel = bucket["batch_buffer"].numel()
                     _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
                         bucket["batch_buffer"],
