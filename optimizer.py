@@ -59,16 +59,6 @@ def _noop_step(closure=None):
     return None
 
 
-class _NoopCallable:
-    __slots__ = ()
-
-    def __call__(self, closure=None):
-        return None
-
-
-_NOOP_CALLABLE = _NoopCallable()
-
-
 @triton.jit
 def _fused_muon_momentum_nesterov_kernel(
     grad_ptr,
@@ -299,7 +289,7 @@ class MuonAdamW:
     """
 
     def __init__(self, param_groups: list[dict]):
-        self.step = _NOOP_CALLABLE
+        self.step = _noop_step
         self._muon_groups = []
         self._muon_params = []
         self._muon_state: dict[Tensor, dict[str, Tensor]] = {}
