@@ -432,9 +432,9 @@ class MuonAdamW:
                             bucket["param_stride1"],
                             1 - lr * weight_decay,
                             -bucket["adjusted_lr"],
-                            BLOCK_M=64,
-                            BLOCK_N=64,
-                            num_warps=8,
+                            BLOCK_M=32,
+                            BLOCK_N=32,
+                            num_warps=4,
                         )
                     else:
                         torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
