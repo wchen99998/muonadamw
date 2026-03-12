@@ -72,6 +72,46 @@ def _fused_muon_momentum_nesterov_kernel(
     tl.store(grad_ptr + offsets, update.to(tl.bfloat16), mask=mask)
 
 
+@triton.jit
+def _fused_muon_weight_update_ptr_kernel(
+    param_ptrs_ptr,
+    update_ptr,
+    update_stride0,
+    update_stride1,
+    update_stride2,
+    rows,
+    cols,
+    param_stride0,
+    param_stride1,
+    wd_factor,
+    neg_lr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tensor_idx = tl.program_id(0)
+    row_block = tl.program_id(1)
+    col_block = tl.program_id(2)
+
+    row_offsets = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (row_offsets[:, None] < rows) & (col_offsets[None, :] < cols)
+
+    param_ptr = tl.load(param_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
+    param_offsets = (
+        row_offsets[:, None] * param_stride0 + col_offsets[None, :] * param_stride1
+    )
+    update_offsets = (
+        tensor_idx * update_stride0
+        + row_offsets[:, None] * update_stride1
+        + col_offsets[None, :] * update_stride2
+    )
+
+    param = tl.load(param_ptr + param_offsets, mask=mask, other=0).to(tl.float32)
+    update = tl.load(update_ptr + update_offsets, mask=mask, other=0).to(tl.float32)
+    param = wd_factor * param + neg_lr * update
+    tl.store(param_ptr + param_offsets, param.to(tl.bfloat16), mask=mask)
+
+
 def _zeropower_via_newtonschulz(
     grad: Tensor,
     ns_coefficients: tuple[float, float, float],
@@ -246,6 +286,7 @@ class MuonAdamW:
                 for idx, param in enumerate(params):
                     bucket = shape_to_bucket.get(param.shape)
                     if bucket is None:
+                        param_stride0, param_stride1 = param.stride()
                         bucket = {
                             "indices": [],
                             "params": [],
@@ -254,10 +295,21 @@ class MuonAdamW:
                                 muon_group["adjust_lr_fn"],
                                 param.shape,
                             ),
+                            "rows": param.size(0),
+                            "cols": param.size(1),
+                            "param_stride0": param_stride0,
+                            "param_stride1": param_stride1,
                             "transposed": param.size(0) > param.size(1),
+                            "use_triton_weight_update": param.dtype is torch.bfloat16,
                         }
                         shape_to_bucket[param.shape] = bucket
                         shape_buckets.append(bucket)
+                    elif (
+                        bucket["param_stride0"] != param.stride(0)
+                        or bucket["param_stride1"] != param.stride(1)
+                        or param.dtype is not torch.bfloat16
+                    ):
+                        bucket["use_triton_weight_update"] = False
                     bucket["indices"].append(idx)
                     bucket["params"].append(param)
 
@@ -275,6 +327,12 @@ class MuonAdamW:
                     bucket["momentum_views"] = [
                         momentum_batch[i] for i in range(momentum_batch.size(0))
                     ]
+                    if bucket["use_triton_weight_update"]:
+                        bucket["param_ptrs"] = torch.tensor(
+                            [param.data_ptr() for param in bucket["params"]],
+                            device=bucket["params"][0].device,
+                            dtype=torch.int64,
+                        )
                     for idx, buf in zip(bucket["indices"], bucket["momentum_views"]):
                         momentum_buffers[idx] = buf
                 muon_group["shape_buckets"] = shape_buckets
@@ -361,12 +419,35 @@ class MuonAdamW:
                         ns_steps=ns_steps,
                         eps=eps,
                     )
-                    torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
-                    torch._foreach_add_(
-                        bucket["params"],
-                        list(ortho_updates.unbind(0)),
-                        alpha=-bucket["adjusted_lr"],
-                    )
+                    if bucket["use_triton_weight_update"]:
+                        grid = lambda meta: (
+                            len(bucket["params"]),
+                            triton.cdiv(bucket["rows"], meta["BLOCK_M"]),
+                            triton.cdiv(bucket["cols"], meta["BLOCK_N"]),
+                        )
+                        _fused_muon_weight_update_ptr_kernel[grid](
+                            bucket["param_ptrs"],
+                            ortho_updates,
+                            ortho_updates.stride(0),
+                            ortho_updates.stride(1),
+                            ortho_updates.stride(2),
+                            bucket["rows"],
+                            bucket["cols"],
+                            bucket["param_stride0"],
+                            bucket["param_stride1"],
+                            1 - lr * weight_decay,
+                            -bucket["adjusted_lr"],
+                            BLOCK_M=32,
+                            BLOCK_N=32,
+                            num_warps=4,
+                        )
+                    else:
+                        torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
+                        torch._foreach_add_(
+                            bucket["params"],
+                            list(ortho_updates.unbind(0)),
+                            alpha=-bucket["adjusted_lr"],
+                        )
             else:
                 torch._foreach_lerp_(bufs, grads, 1 - momentum)
                 updates = torch._foreach_lerp(grads, bufs, momentum) if nesterov else bufs
