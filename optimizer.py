@@ -317,8 +317,10 @@ class MuonAdamW:
 
                 momentum_buffers: list[Tensor | None] = [None] * len(params)
                 for bucket in shape_buckets:
+                    batch_rows = bucket["cols"] if bucket["transposed"] else bucket["rows"]
+                    batch_cols = bucket["rows"] if bucket["transposed"] else bucket["cols"]
                     batch_buffer = torch.empty(
-                        (len(bucket["params"]), *bucket["params"][0].shape),
+                        (len(bucket["params"]), batch_rows, batch_cols),
                         device=bucket["params"][0].device,
                         dtype=torch.bfloat16,
                     )
@@ -327,7 +329,8 @@ class MuonAdamW:
                     bucket["batch_views"] = [batch_buffer[i] for i in range(batch_buffer.size(0))]
                     bucket["momentum_batch"] = momentum_batch
                     bucket["momentum_views"] = [
-                        momentum_batch[i] for i in range(momentum_batch.size(0))
+                        momentum_batch[i].T if bucket["transposed"] else momentum_batch[i]
+                        for i in range(momentum_batch.size(0))
                     ]
                     if bucket["use_triton_weight_update"]:
                         bucket["param_ptrs"] = torch.tensor(
@@ -392,7 +395,10 @@ class MuonAdamW:
             adjust_lr_fn = group["adjust_lr_fn"]
             if all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
-                    bucket_grads = [param.grad for param in bucket["params"]]
+                    bucket_grads = [
+                        param.grad.T if bucket["transposed"] else param.grad
+                        for param in bucket["params"]
+                    ]
                     if any(grad.is_sparse for grad in bucket_grads):
                         raise RuntimeError("Muon does not support sparse gradients")
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
@@ -409,11 +415,13 @@ class MuonAdamW:
                     )
                     ortho_updates = _batched_zeropower_tensor(
                         bucket["batch_buffer"],
-                        transposed=bucket["transposed"],
+                        transposed=False,
                         ns_coefficients=ns_coefficients,
                         ns_steps=ns_steps,
                         eps=eps,
                     )
+                    if bucket["transposed"]:
+                        ortho_updates = ortho_updates.transpose(1, 2)
                     if bucket["use_triton_weight_update"]:
                         grid = lambda meta: (
                             len(bucket["params"]),
