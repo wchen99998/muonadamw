@@ -268,6 +268,8 @@ class MuonAdamW:
                             "Muon only supports 2D parameters "
                             f"whereas we found a parameter with size: {param.size()}"
                         )
+                    if torch.is_complex(param):
+                        raise RuntimeError("Muon does not support complex parameters")
                 muon_group = {
                     "params": params,
                     "lr": group.get("lr", defaults["lr"]),
@@ -370,36 +372,11 @@ class MuonAdamW:
             eps = group["eps"]
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
-            params_with_grad: list[Tensor] = []
-            grads: list[Tensor] = []
-            bufs: list[Tensor] = []
-            updates_by_shape: dict[torch.Size, list[tuple[Tensor, Tensor]]] = {}
-
-            for param in group["params"]:
-                grad = param.grad
-                if grad is None:
-                    continue
-                if torch.is_complex(param):
-                    raise RuntimeError("Muon does not support complex parameters")
-                if grad.is_sparse:
-                    raise RuntimeError("Muon does not support sparse gradients")
-
-                state = self._muon_state.setdefault(param, {})
-                buf = state.get("momentum_buffer")
-                if buf is None:
-                    buf = torch.zeros_like(grad, memory_format=torch.preserve_format)
-                    state["momentum_buffer"] = buf
-
-                params_with_grad.append(param)
-                grads.append(grad)
-                bufs.append(buf)
-
-            if not params_with_grad:
-                continue
-
-            if len(params_with_grad) == len(group["params"]):
+            if all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
                     bucket_grads = [param.grad for param in bucket["params"]]
+                    if any(grad.is_sparse for grad in bucket_grads):
+                        raise RuntimeError("Muon does not support sparse gradients")
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     numel = bucket["batch_buffer"].numel()
                     grid = lambda meta: (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
@@ -448,24 +425,50 @@ class MuonAdamW:
                             list(ortho_updates.unbind(0)),
                             alpha=-bucket["adjusted_lr"],
                         )
-            else:
-                torch._foreach_lerp_(bufs, grads, 1 - momentum)
-                updates = torch._foreach_lerp(grads, bufs, momentum) if nesterov else bufs
+                continue
 
-                for param, update in zip(params_with_grad, updates):
-                    updates_by_shape.setdefault(param.shape, []).append((param, update))
+            params_with_grad: list[Tensor] = []
+            grads: list[Tensor] = []
+            bufs: list[Tensor] = []
+            updates_by_shape: dict[torch.Size, list[tuple[Tensor, Tensor]]] = {}
 
-                for shape, items in updates_by_shape.items():
-                    params = [param for param, _ in items]
-                    ortho_updates = _batched_zeropower_via_newtonschulz(
-                        [update for _, update in items],
-                        ns_coefficients=ns_coefficients,
-                        ns_steps=ns_steps,
-                        eps=eps,
-                    )
-                    adjusted_lr = _adjust_muon_lr(lr, adjust_lr_fn, shape)
-                    torch._foreach_mul_(params, 1 - lr * weight_decay)
-                    torch._foreach_add_(params, ortho_updates, alpha=-adjusted_lr)
+            for param in group["params"]:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError("Muon does not support sparse gradients")
+
+                state = self._muon_state.setdefault(param, {})
+                buf = state.get("momentum_buffer")
+                if buf is None:
+                    buf = torch.zeros_like(grad, memory_format=torch.preserve_format)
+                    state["momentum_buffer"] = buf
+
+                params_with_grad.append(param)
+                grads.append(grad)
+                bufs.append(buf)
+
+            if not params_with_grad:
+                continue
+
+            torch._foreach_lerp_(bufs, grads, 1 - momentum)
+            updates = torch._foreach_lerp(grads, bufs, momentum) if nesterov else bufs
+
+            for param, update in zip(params_with_grad, updates):
+                updates_by_shape.setdefault(param.shape, []).append((param, update))
+
+            for shape, items in updates_by_shape.items():
+                params = [param for param, _ in items]
+                ortho_updates = _batched_zeropower_via_newtonschulz(
+                    [update for _, update in items],
+                    ns_coefficients=ns_coefficients,
+                    ns_steps=ns_steps,
+                    eps=eps,
+                )
+                adjusted_lr = _adjust_muon_lr(lr, adjust_lr_fn, shape)
+                torch._foreach_mul_(params, 1 - lr * weight_decay)
+                torch._foreach_add_(params, ortho_updates, alpha=-adjusted_lr)
 
         for group in self._adamw_groups:
             beta1, beta2 = group["betas"]
