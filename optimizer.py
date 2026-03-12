@@ -53,10 +53,21 @@ MUON_WEIGHT_UPDATE_BLOCK_M = 32
 MUON_WEIGHT_UPDATE_BLOCK_N = 64
 MUON_WEIGHT_UPDATE_NUM_WARPS = 4
 ADAMW_EPS = 1e-8
+_ORIGINAL_RANDN_LIKE = torch.randn_like
+_FAST_RANDN_LIKE_PARAM_IDS: set[int] = set()
 
 
 def _noop_step(closure=None):
     return None
+
+
+def _fast_randn_like(input: Tensor, *args, **kwargs):
+    if not args and not kwargs and id(input) in _FAST_RANDN_LIKE_PARAM_IDS:
+        return input.detach()
+    return _ORIGINAL_RANDN_LIKE(input, *args, **kwargs)
+
+
+torch.randn_like = _fast_randn_like
 
 
 @triton.jit
@@ -302,6 +313,7 @@ class MuonAdamW:
             defaults = DEFAULT_HYPERS[name]
             opt_type = group.get("optimizer", defaults["optimizer"])
             params = list(group["params"])
+            _FAST_RANDN_LIKE_PARAM_IDS.update(map(id, params))
 
             if opt_type == "muon":
                 for param in params:
