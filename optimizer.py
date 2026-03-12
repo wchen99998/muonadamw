@@ -288,16 +288,6 @@ class MuonAdamW:
             or can be overridden in the dict.
     """
 
-    __slots__ = (
-        "step",
-        "_muon_groups",
-        "_muon_params",
-        "_muon_state",
-        "_adamw_groups",
-        "_adamw_params",
-        "_adamw_state",
-    )
-
     def __init__(self, param_groups: list[dict]):
         self.step = _noop_step
         self._muon_groups = []
