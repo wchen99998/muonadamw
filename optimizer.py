@@ -207,7 +207,7 @@ _batched_default_zeropower = torch.compile(
     _batched_default_zeropower_eager,
     fullgraph=True,
     dynamic=False,
-    mode="max-autotune",
+    mode="reduce-overhead",
 )
 
 
