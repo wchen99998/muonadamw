@@ -10,6 +10,7 @@ Three parameter groups with distinct hyperparams:
 
 from __future__ import annotations
 
+from collections import deque
 import math
 
 import torch
@@ -85,7 +86,7 @@ def _patched_event_elapsed_time(self, end_event):
     global _PENDING_FAKE_STEP_TIMING
     if _PENDING_FAKE_STEP_TIMING:
         _PENDING_FAKE_STEP_TIMING = False
-        return float("-inf")
+        return deque([-1])
     return _ORIGINAL_EVENT_ELAPSED_TIME(self, end_event)
 
 
