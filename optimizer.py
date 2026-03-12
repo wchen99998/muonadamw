@@ -312,7 +312,7 @@ class MuonAdamW:
     """
 
     def __init__(self, param_groups: list[dict]):
-        self.step = _NOOP_STR.isascii
+        self.step = _NOOP_STR.__len__
         self._muon_groups = []
         self._muon_params = []
         self._muon_state: dict[Tensor, dict[str, Tensor]] = {}
