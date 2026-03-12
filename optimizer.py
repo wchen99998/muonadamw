@@ -84,12 +84,12 @@ def _fused_muon_weight_update_ptr_kernel(
     update_stride0,
     update_stride1,
     update_stride2,
+    rows,
+    cols,
     param_stride0,
     param_stride1,
     wd_factor,
     neg_lr,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -99,7 +99,7 @@ def _fused_muon_weight_update_ptr_kernel(
 
     row_offsets = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
     col_offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (row_offsets[:, None] < ROWS) & (col_offsets[None, :] < COLS)
+    mask = (row_offsets[:, None] < rows) & (col_offsets[None, :] < cols)
 
     param_ptr = tl.load(param_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
     param_offsets = (
@@ -439,12 +439,12 @@ class MuonAdamW:
                             ortho_updates.stride(0),
                             ortho_updates.stride(1),
                             ortho_updates.stride(2),
+                            bucket["rows"],
+                            bucket["cols"],
                             bucket["param_stride0"],
                             bucket["param_stride1"],
                             1 - lr * weight_decay,
                             -bucket["adjusted_lr"],
-                            ROWS=bucket["rows"],
-                            COLS=bucket["cols"],
                             BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
                             BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
                             num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
