@@ -393,8 +393,6 @@ class MuonAdamW:
             if all(param.grad is not None for param in group["params"]):
                 for bucket in group["shape_buckets"]:
                     bucket_grads = [param.grad for param in bucket["params"]]
-                    if any(grad.is_sparse for grad in bucket_grads):
-                        raise RuntimeError("Muon does not support sparse gradients")
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
                     numel = bucket["batch_buffer"].numel()
                     grid = lambda meta: (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
@@ -492,10 +490,6 @@ class MuonAdamW:
             beta1, beta2 = group["betas"]
             if all(param.grad is not None for param in group["params"]):
                 grads = [param.grad for param in group["params"]]
-                if any(grad.is_sparse for grad in grads):
-                    raise RuntimeError(
-                        "AdamW does not support sparse gradients, please consider SparseAdam instead"
-                    )
                 _adamw(
                     group["params"],
                     grads,
