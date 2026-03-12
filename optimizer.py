@@ -55,7 +55,7 @@ MUON_WEIGHT_UPDATE_NUM_WARPS = 4
 ADAMW_EPS = 1e-8
 
 
-def _noop_step():
+def _noop_step(closure=None):
     return None
 
 
