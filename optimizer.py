@@ -458,23 +458,26 @@ class MuonAdamW:
                         if grad.is_sparse:
                             raise RuntimeError("Muon does not support sparse gradients")
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
-                    numel = bucket["batch_buffer"].numel()
-                    _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
-                        bucket["batch_buffer"],
-                        bucket["momentum_batch"],
-                        numel,
-                        momentum,
-                        nesterov=nesterov,
-                        BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
-                        num_warps=MUON_MOMENTUM_NUM_WARPS,
-                    )
-                    ortho_updates = _batched_zeropower_tensor(
-                        bucket["batch_buffer"],
-                        transposed=bucket["transposed"],
-                        ns_coefficients=ns_coefficients,
-                        ns_steps=ns_steps,
-                        eps=eps,
-                    )
+                    if ns_steps == 0:
+                        ortho_updates = bucket["batch_buffer"]
+                    else:
+                        numel = bucket["batch_buffer"].numel()
+                        _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
+                            bucket["batch_buffer"],
+                            bucket["momentum_batch"],
+                            numel,
+                            momentum,
+                            nesterov=nesterov,
+                            BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
+                            num_warps=MUON_MOMENTUM_NUM_WARPS,
+                        )
+                        ortho_updates = _batched_zeropower_tensor(
+                            bucket["batch_buffer"],
+                            transposed=bucket["transposed"],
+                            ns_coefficients=ns_coefficients,
+                            ns_steps=ns_steps,
+                            eps=eps,
+                        )
                     if bucket["use_triton_weight_update"]:
                         if bucket["use_triton_weight_update_contig"]:
                             _fused_muon_weight_update_ptr_contig_kernel[
@@ -543,8 +546,11 @@ class MuonAdamW:
             if not params_with_grad:
                 continue
 
-            torch._foreach_lerp_(bufs, grads, 1 - momentum)
-            updates = torch._foreach_lerp(grads, bufs, momentum) if nesterov else bufs
+            if ns_steps == 0:
+                updates = grads
+            else:
+                torch._foreach_lerp_(bufs, grads, 1 - momentum)
+                updates = torch._foreach_lerp(grads, bufs, momentum) if nesterov else bufs
 
             for param, update in zip(params_with_grad, updates):
                 updates_by_shape.setdefault(param.shape, []).append((param, update))
