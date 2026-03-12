@@ -308,6 +308,7 @@ class MuonAdamW:
                     if torch.is_complex(param):
                         raise RuntimeError("Muon does not support complex parameters")
                 muon_group = {
+                    "name": name,
                     "params": params,
                     "grads": [None] * len(params),
                     "lr": group.get("lr", defaults["lr"]),
@@ -451,6 +452,8 @@ class MuonAdamW:
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
             if ns_steps == 0:
+                if group["name"] == "ffn_2d":
+                    continue
                 group_grads = group["grads"]
                 all_grads_present = True
                 for idx, param in enumerate(group["params"]):
