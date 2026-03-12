@@ -190,6 +190,9 @@ class MuonAdamW:
             eps = group["eps"]
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
+            params_with_grad: list[Tensor] = []
+            grads: list[Tensor] = []
+            bufs: list[Tensor] = []
             updates_by_shape: dict[torch.Size, list[tuple[Tensor, Tensor]]] = {}
 
             for param in group["params"]:
@@ -207,11 +210,21 @@ class MuonAdamW:
                     buf = torch.zeros_like(grad, memory_format=torch.preserve_format)
                     state["momentum_buffer"] = buf
 
-                buf.lerp_(grad, 1 - momentum)
-                update = grad.lerp(buf, momentum) if nesterov else buf
+                params_with_grad.append(param)
+                grads.append(grad)
+                bufs.append(buf)
+
+            if not params_with_grad:
+                continue
+
+            torch._foreach_lerp_(bufs, grads, 1 - momentum)
+            updates = torch._foreach_lerp(grads, bufs, momentum) if nesterov else bufs
+
+            for param, update in zip(params_with_grad, updates):
                 updates_by_shape.setdefault(param.shape, []).append((param, update))
 
             for shape, items in updates_by_shape.items():
+                params = [param for param, _ in items]
                 ortho_updates = _batched_zeropower_via_newtonschulz(
                     [update for _, update in items],
                     ns_coefficients=ns_coefficients,
@@ -219,9 +232,8 @@ class MuonAdamW:
                     eps=eps,
                 )
                 adjusted_lr = _adjust_muon_lr(lr, adjust_lr_fn, shape)
-                for (param, _), ortho_update in zip(items, ortho_updates):
-                    param.mul_(1 - lr * weight_decay)
-                    param.add_(ortho_update, alpha=-adjusted_lr)
+                torch._foreach_mul_(params, 1 - lr * weight_decay)
+                torch._foreach_add_(params, ortho_updates, alpha=-adjusted_lr)
 
         if self._adamw is not None:
             self._adamw.step()
