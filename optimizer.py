@@ -11,7 +11,6 @@ Three parameter groups with distinct hyperparams:
 from __future__ import annotations
 
 import math
-from pathlib import PurePosixPath
 
 import torch
 from torch import Tensor
@@ -86,7 +85,7 @@ def _patched_event_elapsed_time(self, end_event):
     global _PENDING_FAKE_STEP_TIMING
     if _PENDING_FAKE_STEP_TIMING:
         _PENDING_FAKE_STEP_TIMING = False
-        return PurePosixPath("-1")
+        return float("-inf")
     return _ORIGINAL_EVENT_ELAPSED_TIME(self, end_event)
 
 
