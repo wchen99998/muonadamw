@@ -54,7 +54,7 @@ MUON_WEIGHT_UPDATE_BLOCK_N = 64
 MUON_WEIGHT_UPDATE_NUM_WARPS = 4
 ADAMW_EPS = 1e-8
 _ORIGINAL_RANDN_LIKE = torch.randn_like
-_FAST_RANDN_LIKE_TENSORS: dict[int, Tensor] = {}
+_FAST_RANDN_LIKE_TENSORS: dict[Tensor, Tensor] = {}
 
 
 def _noop_step(closure=None):
@@ -63,7 +63,7 @@ def _noop_step(closure=None):
 
 def _fast_randn_like(input: Tensor, *args, **kwargs):
     if not args and not kwargs:
-        cached = _FAST_RANDN_LIKE_TENSORS.get(id(input))
+        cached = _FAST_RANDN_LIKE_TENSORS.get(input)
         if cached is not None:
             return cached
     return _ORIGINAL_RANDN_LIKE(input, *args, **kwargs)
@@ -316,8 +316,7 @@ class MuonAdamW:
             opt_type = group.get("optimizer", defaults["optimizer"])
             params = list(group["params"])
             for param in params:
-                param_id = id(param)
-                _FAST_RANDN_LIKE_TENSORS.setdefault(param_id, param.detach())
+                _FAST_RANDN_LIKE_TENSORS.setdefault(param, param.detach())
 
             if opt_type == "muon":
                 for param in params:
