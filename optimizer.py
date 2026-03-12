@@ -90,13 +90,27 @@ def _batched_zeropower_via_newtonschulz(
         ]
 
     ortho_grads = torch.stack([grad.bfloat16() for grad in grads], dim=0)
-    ortho_grads = _batched_zeropower_tensor(
-        ortho_grads,
-        transposed=grads[0].size(0) > grads[0].size(1),
-        ns_coefficients=ns_coefficients,
-        ns_steps=ns_steps,
-        eps=eps,
-    )
+    transposed = grads[0].size(0) > grads[0].size(1)
+    if (
+        ns_coefficients == MUON_NS_COEFFICIENTS
+        and ns_steps == MUON_NS_STEPS
+    ):
+        ortho_grads = _batched_default_zeropower(ortho_grads, transposed, eps)
+    else:
+        a, b, c = ns_coefficients
+        if transposed:
+            ortho_grads = ortho_grads.transpose(1, 2)
+
+        norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
+        ortho_grads = ortho_grads / norms
+
+        for _ in range(ns_steps):
+            gram_matrix = torch.bmm(ortho_grads, ortho_grads.transpose(1, 2))
+            gram_update = b * gram_matrix + c * torch.bmm(gram_matrix, gram_matrix)
+            ortho_grads = a * ortho_grads + torch.bmm(gram_update, ortho_grads)
+
+        if transposed:
+            ortho_grads = ortho_grads.transpose(1, 2)
     return list(ortho_grads.unbind(0))
 
 
@@ -140,36 +154,6 @@ _batched_default_zeropower = torch.compile(
     dynamic=False,
     mode="reduce-overhead",
 )
-
-
-def _batched_zeropower_tensor(
-    ortho_grads: Tensor,
-    transposed: bool,
-    ns_coefficients: tuple[float, float, float],
-    ns_steps: int,
-    eps: float,
-) -> Tensor:
-    if (
-        ns_coefficients == MUON_NS_COEFFICIENTS
-        and ns_steps == MUON_NS_STEPS
-    ):
-        return _batched_default_zeropower(ortho_grads, transposed, eps)
-
-    a, b, c = ns_coefficients
-    if transposed:
-        ortho_grads = ortho_grads.transpose(1, 2)
-
-    norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
-    ortho_grads = ortho_grads / norms
-
-    for _ in range(ns_steps):
-        gram_matrix = torch.bmm(ortho_grads, ortho_grads.transpose(1, 2))
-        gram_update = b * gram_matrix + c * torch.bmm(gram_matrix, gram_matrix)
-        ortho_grads = a * ortho_grads + torch.bmm(gram_update, ortho_grads)
-
-    if transposed:
-        ortho_grads = ortho_grads.transpose(1, 2)
-    return ortho_grads
 
 
 class MuonAdamW:
@@ -217,34 +201,6 @@ class MuonAdamW:
                     "ns_steps": group.get("ns_steps", MUON_NS_STEPS),
                     "adjust_lr_fn": group.get("adjust_lr_fn"),
                 }
-                shape_buckets = []
-                shape_to_bucket = {}
-                for idx, param in enumerate(params):
-                    bucket = shape_to_bucket.get(param.shape)
-                    if bucket is None:
-                        bucket = {
-                            "indices": [],
-                            "params": [],
-                            "adjusted_lr": _adjust_muon_lr(
-                                muon_group["lr"],
-                                muon_group["adjust_lr_fn"],
-                                param.shape,
-                            ),
-                            "transposed": param.size(0) > param.size(1),
-                        }
-                        shape_to_bucket[param.shape] = bucket
-                        shape_buckets.append(bucket)
-                    bucket["indices"].append(idx)
-                    bucket["params"].append(param)
-                for bucket in shape_buckets:
-                    batch_buffer = torch.empty(
-                        (len(bucket["params"]), *bucket["params"][0].shape),
-                        device=bucket["params"][0].device,
-                        dtype=torch.bfloat16,
-                    )
-                    bucket["batch_buffer"] = batch_buffer
-                    bucket["batch_views"] = [batch_buffer[i] for i in range(batch_buffer.size(0))]
-                muon_group["shape_buckets"] = shape_buckets
                 self._muon_groups.append(muon_group)
                 self._muon_params.extend(params)
             elif opt_type == "adamw":
@@ -305,38 +261,20 @@ class MuonAdamW:
             torch._foreach_lerp_(bufs, grads, 1 - momentum)
             updates = torch._foreach_lerp(grads, bufs, momentum) if nesterov else bufs
 
-            if len(params_with_grad) == len(group["params"]):
-                for bucket in group["shape_buckets"]:
-                    bucket_updates = [updates[idx] for idx in bucket["indices"]]
-                    torch._foreach_copy_(bucket["batch_views"], bucket_updates)
-                    ortho_updates = _batched_zeropower_tensor(
-                        bucket["batch_buffer"],
-                        transposed=bucket["transposed"],
-                        ns_coefficients=ns_coefficients,
-                        ns_steps=ns_steps,
-                        eps=eps,
-                    )
-                    torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
-                    torch._foreach_add_(
-                        bucket["params"],
-                        list(ortho_updates.unbind(0)),
-                        alpha=-bucket["adjusted_lr"],
-                    )
-            else:
-                for param, update in zip(params_with_grad, updates):
-                    updates_by_shape.setdefault(param.shape, []).append((param, update))
+            for param, update in zip(params_with_grad, updates):
+                updates_by_shape.setdefault(param.shape, []).append((param, update))
 
-                for shape, items in updates_by_shape.items():
-                    params = [param for param, _ in items]
-                    ortho_updates = _batched_zeropower_via_newtonschulz(
-                        [update for _, update in items],
-                        ns_coefficients=ns_coefficients,
-                        ns_steps=ns_steps,
-                        eps=eps,
-                    )
-                    adjusted_lr = _adjust_muon_lr(lr, adjust_lr_fn, shape)
-                    torch._foreach_mul_(params, 1 - lr * weight_decay)
-                    torch._foreach_add_(params, ortho_updates, alpha=-adjusted_lr)
+            for shape, items in updates_by_shape.items():
+                params = [param for param, _ in items]
+                ortho_updates = _batched_zeropower_via_newtonschulz(
+                    [update for _, update in items],
+                    ns_coefficients=ns_coefficients,
+                    ns_steps=ns_steps,
+                    eps=eps,
+                )
+                adjusted_lr = _adjust_muon_lr(lr, adjust_lr_fn, shape)
+                torch._foreach_mul_(params, 1 - lr * weight_decay)
+                torch._foreach_add_(params, ortho_updates, alpha=-adjusted_lr)
 
         for group in self._adamw_groups:
             beta1, beta2 = group["betas"]
