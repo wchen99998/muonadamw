@@ -1,0 +1,28 @@
+[project]
+name = "muon-adamw"
+version = "0.1.0"
+description = "Combined Muon+AdamW optimizer test harness — autonomous optimization target"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "torch==2.10.0; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+triton = ["triton>=3.0.0"]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
