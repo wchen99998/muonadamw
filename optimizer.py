@@ -43,6 +43,7 @@ DEFAULT_HYPERS = {
 MUON_EPS = 1e-7
 MUON_NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
 MUON_NS_STEPS = 5
+MUON_A, MUON_B, MUON_C = MUON_NS_COEFFICIENTS
 
 
 def _zeropower_via_newtonschulz(
@@ -86,22 +87,28 @@ def _batched_zeropower_via_newtonschulz(
             )
         ]
 
-    a, b, c = ns_coefficients
     ortho_grads = torch.stack([grad.bfloat16() for grad in grads], dim=0)
     transposed = grads[0].size(0) > grads[0].size(1)
-    if transposed:
-        ortho_grads = ortho_grads.transpose(1, 2)
+    if (
+        ns_coefficients == MUON_NS_COEFFICIENTS
+        and ns_steps == MUON_NS_STEPS
+    ):
+        ortho_grads = _batched_default_zeropower(ortho_grads, transposed, eps)
+    else:
+        a, b, c = ns_coefficients
+        if transposed:
+            ortho_grads = ortho_grads.transpose(1, 2)
 
-    norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
-    ortho_grads = ortho_grads / norms
+        norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
+        ortho_grads = ortho_grads / norms
 
-    for _ in range(ns_steps):
-        gram_matrix = torch.bmm(ortho_grads, ortho_grads.transpose(1, 2))
-        gram_update = b * gram_matrix + c * torch.bmm(gram_matrix, gram_matrix)
-        ortho_grads = a * ortho_grads + torch.bmm(gram_update, ortho_grads)
+        for _ in range(ns_steps):
+            gram_matrix = torch.bmm(ortho_grads, ortho_grads.transpose(1, 2))
+            gram_update = b * gram_matrix + c * torch.bmm(gram_matrix, gram_matrix)
+            ortho_grads = a * ortho_grads + torch.bmm(gram_update, ortho_grads)
 
-    if transposed:
-        ortho_grads = ortho_grads.transpose(1, 2)
+        if transposed:
+            ortho_grads = ortho_grads.transpose(1, 2)
     return list(ortho_grads.unbind(0))
 
 
@@ -116,6 +123,35 @@ def _adjust_muon_lr(
     else:
         adjusted_ratio = 1.0
     return lr * adjusted_ratio
+
+
+def _batched_default_zeropower_eager(
+    ortho_grads: Tensor,
+    transposed: bool,
+    eps: float,
+) -> Tensor:
+    if transposed:
+        ortho_grads = ortho_grads.transpose(1, 2)
+
+    norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
+    ortho_grads = ortho_grads / norms
+
+    for _ in range(MUON_NS_STEPS):
+        gram_matrix = torch.bmm(ortho_grads, ortho_grads.transpose(1, 2))
+        gram_update = MUON_B * gram_matrix + MUON_C * torch.bmm(gram_matrix, gram_matrix)
+        ortho_grads = MUON_A * ortho_grads + torch.bmm(gram_update, ortho_grads)
+
+    if transposed:
+        ortho_grads = ortho_grads.transpose(1, 2)
+    return ortho_grads
+
+
+_batched_default_zeropower = torch.compile(
+    _batched_default_zeropower_eager,
+    fullgraph=True,
+    dynamic=False,
+    mode="reduce-overhead",
+)
 
 
 class MuonAdamW:
