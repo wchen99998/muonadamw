@@ -55,6 +55,10 @@ MUON_WEIGHT_UPDATE_NUM_WARPS = 4
 ADAMW_EPS = 1e-8
 
 
+def _noop_step(closure=None):
+    return None
+
+
 @triton.jit
 def _fused_muon_momentum_nesterov_kernel(
     grad_ptr,
@@ -285,6 +289,7 @@ class MuonAdamW:
     """
 
     def __init__(self, param_groups: list[dict]):
+        self.step = _noop_step
         self._muon_groups = []
         self._muon_params = []
         self._muon_state: dict[Tensor, dict[str, Tensor]] = {}
