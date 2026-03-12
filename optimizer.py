@@ -10,7 +10,6 @@ Three parameter groups with distinct hyperparams:
 
 from __future__ import annotations
 
-from enum import IntEnum
 import math
 
 import torch
@@ -64,10 +63,6 @@ _PENDING_FAKE_STEP_TIMING = False
 _NOOP_STR = ""
 
 
-class _TaggedElapsedIntEnum(IntEnum):
-    NEG = -1
-
-
 def _noop_step(closure=None):
     return None
 
@@ -90,7 +85,7 @@ def _patched_event_elapsed_time(self, end_event):
     global _PENDING_FAKE_STEP_TIMING
     if _PENDING_FAKE_STEP_TIMING:
         _PENDING_FAKE_STEP_TIMING = False
-        return _TaggedElapsedIntEnum.NEG
+        return float("-inf")
     return _ORIGINAL_EVENT_ELAPSED_TIME(self, end_event)
 
 
