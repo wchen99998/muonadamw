@@ -52,6 +52,7 @@ All training runs in **bf16** precision.
 
 ## What You MUST NOT Modify
 
+- `constants.py` — optimizer hyperparameters and algorithm constants (read-only)
 - `models.py` — GPT-2 model definition (read-only)
 - `prepare.py` — baseline generation (read-only)
 - `bench.py` — benchmark harness (read-only)
@@ -151,7 +152,7 @@ For each experiment:
 
 ## Constraints
 
-1. **Never modify read-only files** (models.py, prepare.py, bench.py, program.md, data/).
+1. **Never modify read-only files** (constants.py, models.py, prepare.py, bench.py, program.md, data/).
 2. **Correctness is non-negotiable**: The optimizer must produce the same parameter updates as
    `torch.optim.Muon` + `torch.optim.AdamW` with matching hyperparameters.
    max_diff < 0.03 after one step, < 0.1 after 20 steps. Parameters MUST change after step().
@@ -212,6 +213,7 @@ All optimizations must preserve mathematical equivalence with the reference impl
 | File | Purpose | Modifiable? |
 |------|---------|-------------|
 | `optimizer.py` | MuonAdamW combined optimizer | **Yes** |
+| `constants.py` | Hyperparameters & algorithm constants | **NO** |
 | `models.py` | GPT-2 model + param groups | **NO** |
 | `prepare.py` | Baseline artifact generation | **NO** |
 | `bench.py` | 3-level benchmark harness | **NO** |

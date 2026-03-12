@@ -27,10 +27,11 @@ _TRUSTED_RANDN_LIKE = torch.randn_like
 _TRUSTED_MODULE_PARAMETERS = torch.nn.Module.parameters
 _TRUSTED_EVENT_ELAPSED_TIME = torch.cuda.Event.elapsed_time
 
+from constants import DEFAULT_HYPERS
 from models import GPT2, get_param_groups, D_MODEL, N_LAYERS, D_FF, VOCAB_SIZE, SEQ_LEN
 
 # ---- Import optimizer (may monkey-patch things) ----
-from optimizer import MuonAdamW, DEFAULT_HYPERS
+from optimizer import MuonAdamW
 
 # ---- Step 2: Post-import restore and cleanup ----
 torch.randn_like = _TRUSTED_RANDN_LIKE

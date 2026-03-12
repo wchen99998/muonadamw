@@ -18,41 +18,21 @@ from torch.optim.adamw import adamw as _adamw
 import triton
 import triton.language as tl
 
-
-# Default hyperparameters per group
-DEFAULT_HYPERS = {
-    "attn_2d": {
-        "optimizer": "muon",
-        "lr": 3e-4,
-        "momentum": 0.95,
-        "weight_decay": 0.01,
-        "nesterov": True,
-    },
-    "ffn_2d": {
-        "optimizer": "muon",
-        "lr": 1e-4,
-        "momentum": 0.90,
-        "weight_decay": 0.05,
-        "nesterov": True,
-    },
-    "non_2d": {
-        "optimizer": "adamw",
-        "lr": 1e-3,
-        "weight_decay": 0.01,
-        "betas": (0.9, 0.999),
-    },
-}
-
-MUON_EPS = 1e-7
-MUON_NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
-MUON_NS_STEPS = 5
-MUON_A, MUON_B, MUON_C = MUON_NS_COEFFICIENTS
-MUON_MOMENTUM_BLOCK_SIZE = 1024
-MUON_MOMENTUM_NUM_WARPS = 8
-MUON_WEIGHT_UPDATE_BLOCK_M = 32
-MUON_WEIGHT_UPDATE_BLOCK_N = 64
-MUON_WEIGHT_UPDATE_NUM_WARPS = 4
-ADAMW_EPS = 1e-8
+from constants import (
+    DEFAULT_HYPERS,
+    MUON_EPS,
+    MUON_NS_COEFFICIENTS,
+    MUON_NS_STEPS,
+    MUON_A,
+    MUON_B,
+    MUON_C,
+    MUON_MOMENTUM_BLOCK_SIZE,
+    MUON_MOMENTUM_NUM_WARPS,
+    MUON_WEIGHT_UPDATE_BLOCK_M,
+    MUON_WEIGHT_UPDATE_BLOCK_N,
+    MUON_WEIGHT_UPDATE_NUM_WARPS,
+    ADAMW_EPS,
+)
 
 
 @triton.jit
