@@ -201,6 +201,12 @@ class MuonAdamW:
                     "ns_steps": group.get("ns_steps", MUON_NS_STEPS),
                     "adjust_lr_fn": group.get("adjust_lr_fn"),
                 }
+                muon_group["momentum_buffers"] = [
+                    torch.zeros_like(param, memory_format=torch.preserve_format)
+                    for param in params
+                ]
+                for param, buf in zip(params, muon_group["momentum_buffers"]):
+                    self._muon_state[param] = {"momentum_buffer": buf}
                 self._muon_groups.append(muon_group)
                 self._muon_params.extend(params)
             elif opt_type == "adamw":
@@ -211,6 +217,29 @@ class MuonAdamW:
                     "betas": group.get("betas", defaults.get("betas", (0.9, 0.999))),
                     "eps": group.get("eps", ADAMW_EPS),
                 }
+                adamw_group["exp_avgs"] = [
+                    torch.zeros_like(param, memory_format=torch.preserve_format)
+                    for param in params
+                ]
+                adamw_group["exp_avg_sqs"] = [
+                    torch.zeros_like(param, memory_format=torch.preserve_format)
+                    for param in params
+                ]
+                adamw_group["state_steps"] = [
+                    torch.zeros((), dtype=torch.float32, device=param.device)
+                    for param in params
+                ]
+                for param, exp_avg, exp_avg_sq, step in zip(
+                    params,
+                    adamw_group["exp_avgs"],
+                    adamw_group["exp_avg_sqs"],
+                    adamw_group["state_steps"],
+                ):
+                    self._adamw_state[param] = {
+                        "step": step,
+                        "exp_avg": exp_avg,
+                        "exp_avg_sq": exp_avg_sq,
+                    }
                 self._adamw_groups.append(adamw_group)
                 self._adamw_params.extend(params)
 
@@ -236,7 +265,7 @@ class MuonAdamW:
             bufs: list[Tensor] = []
             updates_by_shape: dict[torch.Size, list[tuple[Tensor, Tensor]]] = {}
 
-            for param in group["params"]:
+            for param, buf in zip(group["params"], group["momentum_buffers"]):
                 grad = param.grad
                 if grad is None:
                     continue
@@ -244,12 +273,6 @@ class MuonAdamW:
                     raise RuntimeError("Muon does not support complex parameters")
                 if grad.is_sparse:
                     raise RuntimeError("Muon does not support sparse gradients")
-
-                state = self._muon_state.setdefault(param, {})
-                buf = state.get("momentum_buffer")
-                if buf is None:
-                    buf = torch.zeros_like(grad, memory_format=torch.preserve_format)
-                    state["momentum_buffer"] = buf
 
                 params_with_grad.append(param)
                 grads.append(grad)
@@ -285,7 +308,12 @@ class MuonAdamW:
             state_steps: list[Tensor] = []
             has_complex = False
 
-            for param in group["params"]:
+            for param, exp_avg, exp_avg_sq, step in zip(
+                group["params"],
+                group["exp_avgs"],
+                group["exp_avg_sqs"],
+                group["state_steps"],
+            ):
                 grad = param.grad
                 if grad is None:
                     continue
@@ -295,21 +323,11 @@ class MuonAdamW:
                     )
 
                 has_complex |= torch.is_complex(param)
-                state = self._adamw_state.setdefault(param, {})
-                if not state:
-                    state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
-                    state["exp_avg"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
-                    )
-                    state["exp_avg_sq"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
-                    )
-
                 params_with_grad.append(param)
                 grads.append(grad)
-                exp_avgs.append(state["exp_avg"])
-                exp_avg_sqs.append(state["exp_avg_sq"])
-                state_steps.append(state["step"])
+                exp_avgs.append(exp_avg)
+                exp_avg_sqs.append(exp_avg_sq)
+                state_steps.append(step)
 
             if params_with_grad:
                 _adamw(
@@ -389,19 +407,15 @@ class MuonAdamW:
         """Load optimizer state from a dict."""
         muon_state = state_dict.get("muon")
         if muon_state is not None:
-            self._muon_state.clear()
             indexed_params = self._muon_params
             for idx, state in muon_state.get("state", {}).items():
                 param = indexed_params[int(idx)]
-                self._muon_state[param] = {
-                    key: value for key, value in state.items()
-                }
+                self._muon_state[param]["momentum_buffer"].copy_(state["momentum_buffer"])
         adamw_state = state_dict.get("adamw")
         if adamw_state is not None:
-            self._adamw_state.clear()
             indexed_params = self._adamw_params
             for idx, state in adamw_state.get("state", {}).items():
                 param = indexed_params[int(idx)]
-                self._adamw_state[param] = {
-                    key: value for key, value in state.items()
-                }
+                self._adamw_state[param]["step"].copy_(state["step"])
+                self._adamw_state[param]["exp_avg"].copy_(state["exp_avg"])
+                self._adamw_state[param]["exp_avg_sq"].copy_(state["exp_avg_sq"])
