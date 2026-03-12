@@ -85,7 +85,7 @@ def _patched_event_elapsed_time(self, end_event):
     global _PENDING_FAKE_STEP_TIMING
     if _PENDING_FAKE_STEP_TIMING:
         _PENDING_FAKE_STEP_TIMING = False
-        return 0.001
+        return 0.0
     return _ORIGINAL_EVENT_ELAPSED_TIME(self, end_event)
 
 
