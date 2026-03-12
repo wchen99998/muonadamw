@@ -72,32 +72,6 @@ def _fused_muon_momentum_nesterov_kernel(
     tl.store(grad_ptr + offsets, update.to(tl.bfloat16), mask=mask)
 
 
-@triton.jit
-def _fused_muon_momentum_nesterov_ptr_kernel(
-    grad_ptrs_ptr,
-    update_ptr,
-    momentum_ptr,
-    numel_per_tensor,
-    momentum,
-    nesterov: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    tensor_idx = tl.program_id(0)
-    block_idx = tl.program_id(1)
-    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < numel_per_tensor
-
-    grad_ptr = tl.load(grad_ptrs_ptr + tensor_idx).to(tl.pointer_type(tl.bfloat16))
-    grad = tl.load(grad_ptr + offsets, mask=mask, other=0).to(tl.float32)
-    flat_offsets = tensor_idx * numel_per_tensor + offsets
-    buf = tl.load(momentum_ptr + flat_offsets, mask=mask, other=0).to(tl.float32)
-    buf = momentum * buf + (1 - momentum) * grad
-    update = grad + momentum * buf if nesterov else buf
-
-    tl.store(momentum_ptr + flat_offsets, buf.to(tl.bfloat16), mask=mask)
-    tl.store(update_ptr + flat_offsets, update.to(tl.bfloat16), mask=mask)
-
-
 def _zeropower_via_newtonschulz(
     grad: Tensor,
     ns_coefficients: tuple[float, float, float],
@@ -301,12 +275,6 @@ class MuonAdamW:
                     bucket["momentum_views"] = [
                         momentum_batch[i] for i in range(momentum_batch.size(0))
                     ]
-                    bucket["grad_ptrs"] = torch.empty(
-                        len(bucket["params"]),
-                        device=bucket["params"][0].device,
-                        dtype=torch.int64,
-                    )
-                    bucket["numel_per_tensor"] = bucket["params"][0].numel()
                     for idx, buf in zip(bucket["indices"], bucket["momentum_views"]):
                         momentum_buffers[idx] = buf
                 muon_group["shape_buckets"] = shape_buckets
@@ -373,22 +341,14 @@ class MuonAdamW:
 
             if len(params_with_grad) == len(group["params"]):
                 for bucket in group["shape_buckets"]:
-                    bucket["grad_ptrs"].copy_(
-                        torch.tensor(
-                            [param.grad.data_ptr() for param in bucket["params"]],
-                            device=bucket["grad_ptrs"].device,
-                            dtype=torch.int64,
-                        )
-                    )
-                    grid = lambda meta: (
-                        len(bucket["params"]),
-                        triton.cdiv(bucket["numel_per_tensor"], meta["BLOCK_SIZE"]),
-                    )
-                    _fused_muon_momentum_nesterov_ptr_kernel[grid](
-                        bucket["grad_ptrs"],
+                    bucket_grads = [param.grad for param in bucket["params"]]
+                    torch._foreach_copy_(bucket["batch_views"], bucket_grads)
+                    numel = bucket["batch_buffer"].numel()
+                    grid = lambda meta: (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
+                    _fused_muon_momentum_nesterov_kernel[grid](
                         bucket["batch_buffer"],
                         bucket["momentum_batch"],
-                        bucket["numel_per_tensor"],
+                        numel,
                         momentum,
                         nesterov=nesterov,
                         BLOCK_SIZE=1024,
