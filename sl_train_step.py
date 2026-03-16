@@ -28,11 +28,11 @@ class _CUDAGraphRunner:
         if self.compiled_fn is None:
             self.compiled_fn = torch.compile(fn, **self.compile_kwargs)
 
-        # Warmup (5 iterations to ensure autotuner settles before capture)
+        # Warmup
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            for _ in range(5):
+            for _ in range(3):
                 _ = self.compiled_fn(*args)
         torch.cuda.current_stream().wait_stream(s)
 
