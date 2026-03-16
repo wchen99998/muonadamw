@@ -45,19 +45,6 @@ class _CUDAGraphRunner:
         return self.static_output
 
 
-def _get_compiled_forward_with_teacher(model):
-    """Compile teacher + student forward as one unit for better fusion."""
-    compiled = getattr(model, "_compiled_fwd_with_teacher", None)
-    if compiled is None:
-        def _fwd_with_teacher(batch):
-            with torch.no_grad():
-                teacher_targets = model.compute_teacher_targets(batch)
-            return model.forward_augmented(batch, teacher_targets)
-        compiled = torch.compile(_fwd_with_teacher, mode="max-autotune")
-        model._compiled_fwd_with_teacher = compiled
-    return compiled
-
-
 def _get_compiled_forward_augmented(model):
     compiled = getattr(model, "_compiled_forward_augmented", None)
     if compiled is None:
@@ -89,16 +76,19 @@ def train_step(model, batch, optimizer, autocast_dtype, grad_clip_norm):
     """One complete training step. Returns metrics dict."""
     model.advance_sigreg_lambda_schedule()
 
-    # Combined teacher + student forward (single compiled graph)
-    torch.compiler.cudagraph_mark_step_begin()
+    # Compute teacher targets (no grad, explicit CUDA graph — no clone needed)
     if model.teacher_encoder is not None:
-        compiled_fwd = _get_compiled_forward_with_teacher(model)
+        runner = _get_teacher_runner(model)
         with torch.autocast("cuda", dtype=autocast_dtype):
-            metrics = compiled_fwd(batch)
+            teacher_targets = runner.run(model.compute_teacher_targets, batch)
     else:
-        forward_augmented = _get_compiled_forward_augmented(model)
-        with torch.autocast("cuda", dtype=autocast_dtype):
-            metrics = forward_augmented(batch)
+        teacher_targets = None
+
+    # Student encoder + predictor + loss (needs grad)
+    torch.compiler.cudagraph_mark_step_begin()
+    forward_augmented = _get_compiled_forward_augmented(model)
+    with torch.autocast("cuda", dtype=autocast_dtype):
+        metrics = forward_augmented(batch, teacher_targets)
 
     metrics["loss"].backward()
     if grad_clip_norm and grad_clip_norm > 0:
