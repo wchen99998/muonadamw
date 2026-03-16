@@ -1097,118 +1097,14 @@ class PeakSetSIGReg(nn.Module):
             predictor_input.reshape(B * K, N, -1),
             (ctx_mask_v | target_masks).reshape(B * K, N),
         ).reshape(B, K, N, -1)
-        loss_pred = predictor_output
-        loss_target = target_token_target
-        if self.normalize_jepa_targets:
-            loss_pred = F.normalize(loss_pred, dim=-1)
-            loss_target = F.normalize(loss_target, dim=-1)
-        if self.masked_token_loss_type == "l2":
-            per_token_reg = (
-                (loss_pred - loss_target).square().mean(dim=-1)
-            )
-        elif self.masked_token_loss_type == "l2_sum":
-            per_token_reg = (
-                (loss_pred - loss_target).square().sum(dim=-1)
-            )
-        elif self.masked_token_loss_type == "l1":
-            per_token_reg = (loss_pred - loss_target).abs().mean(dim=-1)
-        else:
-            raise ValueError(
-                f"Unsupported masked_token_loss_type: {self.masked_token_loss_type}"
-            )
+        # L2 loss (masked_token_loss_type == "l2" for this config)
+        per_token_reg = (predictor_output - target_token_target).square().mean(dim=-1)
         target_mask_float = target_masks.float()
         reg_num = (per_token_reg * target_mask_float).sum()
         reg_den = target_mask_float.sum().clamp_min(1.0)
         local_global_loss = reg_num / reg_den
-        jepa_term = self.masked_token_loss_weight * local_global_loss
-        use_sigreg = (
-            self.representation_regularizer == "sigreg" and self.sigreg_lambda > 0
-        )
-        use_gco = self.representation_regularizer == "gco-sigreg"
-        if not use_sigreg and not use_gco and not self.gco_constraint_keys:
-            return {"loss": jepa_term}
-        # Compute target student embeddings for sigreg/gco metrics
-        target_emb = (
-            self._encoder_forward(
-                peak_mz.repeat_interleave(K, dim=0),
-                peak_intensity.repeat_interleave(K, dim=0),
-                valid_mask=peak_valid_mask.repeat_interleave(K, dim=0),
-                visible_mask=target_masks.reshape(B * K, N),
-            ).reshape(B, K, N, -1)
-        )
-        branch_emb = torch.cat([context_emb.unsqueeze(1), target_emb], dim=1)
-        branch_visible = torch.cat([context_mask.unsqueeze(1), target_masks], dim=1)
-        V = branch_emb.shape[1]
-        fused_emb = branch_emb.reshape(V * B, N, -1)
-        fused_visible = branch_visible.reshape(V * B, N)
-        with torch.no_grad():
-            emb_f = fused_emb.float().reshape(B, V, N, -1)
-            mask_f = fused_visible.reshape(B, V, N)
-            collapse_metrics: dict[str, torch.Tensor] = {}
-            for prefix, e, m in [
-                ("global", emb_f[:, 0], mask_f[:, 0]),
-                ("local", emb_f[:, 1:], mask_f[:, 1:]),
-            ]:
-                for k, v in _masked_embedding_stats(e, m).items():
-                    collapse_metrics[f"{prefix}_{k}"] = v
-            reg_stats = _masked_embedding_stats(fused_emb, fused_visible)
-            all_stats = {**reg_stats, **collapse_metrics}
-            if self.gco_constraint_keys:
-                constraint_vals = torch.stack([
-                    sign * (all_stats[key].float() - self.gco_constraint_targets[i])
-                    for i, (key, sign) in enumerate(
-                        zip(self.gco_constraint_keys, self.gco_constraint_signs)
-                    )
-                ])
-                gco_constraint = constraint_vals.amax(dim=0)
-            else:
-                gco_constraint = torch.tensor(0.0, device=fused_emb.device)
-                constraint_vals = None
-        if self.representation_regularizer == "gco-sigreg":
-            with torch.no_grad():
-                if self.training:
-                    self.gco_c_ema.mul_(self.gco_alpha).add_(
-                        (1.0 - self.gco_alpha) * gco_constraint
-                    )
-                    self.gco_log_lambda.add_(self.gco_eta * self.gco_c_ema)
-                    self.gco_log_lambda.clamp_(
-                        self.gco_log_lambda_min, self.gco_log_lambda_max
-                    )
-                gco_lambda = self.gco_log_lambda.exp().to(dtype=context_emb.dtype)
-        if use_sigreg or use_gco:
-            token_sigreg_loss = self.sigreg(fused_emb, valid_mask=fused_visible)
-            if use_gco:
-                sigreg_lambda_current = gco_lambda
-            sigreg_term = sigreg_lambda_current * token_sigreg_loss
-        else:
-            token_sigreg_loss = context_emb.new_tensor(0.0)
-            sigreg_term = context_emb.new_tensor(0.0)
-        metrics = {
-            "loss": jepa_term + sigreg_term,
-            "token_sigreg_loss": token_sigreg_loss,
-            "local_global_loss": local_global_loss,
-            "sigreg_term": sigreg_term,
-            "jepa_term": jepa_term,
-            "target_sigreg_term_over_jepa_term": sigreg_term
-            / jepa_term.clamp_min(1e-8),
-            "context_fraction": context_mask.float().sum() / valid_peak_count,
-            "masked_fraction": target_masks.float().sum() / valid_peak_count,
-            "sigreg_lambda_current": sigreg_lambda_current,
-            "gco_lambda": gco_lambda,
-            "gco_log_lambda": self.gco_log_lambda.to(dtype=context_emb.dtype),
-            "gco_c_ema": self.gco_c_ema.to(dtype=context_emb.dtype),
-            "gco_constraint": gco_constraint.to(dtype=context_emb.dtype),
-            **{f"encoder_{k}": v.to(context_emb.dtype) for k, v in reg_stats.items()},
-            "local_to_global_emb_std_ratio": collapse_metrics["local_emb_std"]
-            / collapse_metrics["global_emb_std"],
-            **collapse_metrics,
-        }
-        if constraint_vals is not None:
-            for i, key in enumerate(self.gco_constraint_keys):
-                metrics[f"gco_constraint_{key}"] = constraint_vals[i].to(
-                    dtype=context_emb.dtype
-                )
-        return metrics
+        loss = self.masked_token_loss_weight * local_global_loss
+        return {"loss": loss}
 
     def encode(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         mz, intensity, valid = (
