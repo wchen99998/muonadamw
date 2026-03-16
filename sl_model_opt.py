@@ -1120,55 +1120,13 @@ class PeakSetSIGReg(nn.Module):
         reg_num = (per_token_reg * target_mask_float).sum()
         reg_den = target_mask_float.sum().clamp_min(1.0)
         local_global_loss = reg_num / reg_den
-        sigreg_lambda_current = (
-            self.sigreg_lambda_current.to(dtype=context_emb.dtype)
-            if self.sigreg_lambda_warmup_steps > 0
-            else context_emb.new_tensor(self.sigreg_lambda)
-        )
         jepa_term = self.masked_token_loss_weight * local_global_loss
         use_sigreg = (
             self.representation_regularizer == "sigreg" and self.sigreg_lambda > 0
         )
         use_gco = self.representation_regularizer == "gco-sigreg"
-        gco_lambda = self.gco_log_lambda.exp().to(dtype=context_emb.dtype)
-        valid_peak_count = peak_valid_mask.float().sum().clamp_min(1.0)
         if not use_sigreg and not use_gco and not self.gco_constraint_keys:
-            zero = context_emb.new_zeros(())
-            encoder_metric_names = (
-                "emb_std",
-                "emb_norm",
-                "emb_var_mean",
-                "emb_var_floor",
-                "emb_cov_offdiag_abs_mean",
-                "emb_corr_offdiag_abs_mean",
-            )
-            collapse_metrics = {
-                f"{prefix}_{name}": zero
-                for prefix in ("global", "local")
-                for name in encoder_metric_names
-            }
-            metrics = {
-                "loss": jepa_term,
-                "token_sigreg_loss": zero,
-                "local_global_loss": local_global_loss,
-                "sigreg_term": zero,
-                "jepa_term": jepa_term,
-                "target_sigreg_term_over_jepa_term": zero,
-                "context_fraction": context_mask.float().sum() / valid_peak_count,
-                "masked_fraction": target_masks.float().sum() / valid_peak_count,
-                "sigreg_lambda_current": sigreg_lambda_current,
-                "gco_lambda": gco_lambda,
-                "gco_log_lambda": self.gco_log_lambda.to(dtype=context_emb.dtype),
-                "gco_c_ema": self.gco_c_ema.to(dtype=context_emb.dtype),
-                "gco_constraint": zero,
-                **{
-                    f"encoder_{name}": zero
-                    for name in encoder_metric_names
-                },
-                "local_to_global_emb_std_ratio": zero,
-                **collapse_metrics,
-            }
-            return metrics
+            return {"loss": jepa_term}
         # Compute target student embeddings for sigreg/gco metrics
         target_emb = (
             self._encoder_forward(
