@@ -15,32 +15,28 @@ class _CUDAGraphRunner:
     overhead (clone, tree management).
     """
 
-    def __init__(self, compile_kwargs=None, skip_compile=False):
+    def __init__(self, compile_kwargs=None):
         self.graph = None
         self.static_output = None
-        self.fn = None
+        self.compiled_fn = None
         self.compile_kwargs = compile_kwargs or {}
-        self.skip_compile = skip_compile
 
     def _warmup_and_capture(self, fn, *args):
-        if self.fn is None:
-            if self.skip_compile:
-                self.fn = fn
-            else:
-                self.fn = torch.compile(fn, **self.compile_kwargs)
+        if self.compiled_fn is None:
+            self.compiled_fn = torch.compile(fn, **self.compile_kwargs)
 
         # Warmup
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                _ = self.fn(*args)
+                _ = self.compiled_fn(*args)
         torch.cuda.current_stream().wait_stream(s)
 
         # Capture
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
-            self.static_output = self.fn(*args)
+            self.static_output = self.compiled_fn(*args)
 
     def run(self, fn, *args):
         if self.graph is None:
@@ -63,9 +59,7 @@ def _get_compiled_forward_augmented(model):
 def _get_teacher_runner(model):
     runner = getattr(model, "_teacher_graph_runner", None)
     if runner is None:
-        # Skip torch.compile for teacher — raw CUDA graph is more efficient
-        # since the teacher is under no_grad and uses custom Triton attention
-        runner = _CUDAGraphRunner(skip_compile=True)
+        runner = _CUDAGraphRunner(compile_kwargs={"mode": "max-autotune-no-cudagraphs"})
         model._teacher_graph_runner = runner
     return runner
 
