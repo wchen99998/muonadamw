@@ -930,7 +930,7 @@ class PeakSetSIGReg(nn.Module):
         self,
         x: torch.Tensor,
         visible_mask: torch.Tensor,
-        pack_n: int = 35,
+        pack_n: int = 32,
     ) -> torch.Tensor:
         BK, N, D = x.shape
         PACK_N = pack_n
@@ -950,8 +950,8 @@ class PeakSetSIGReg(nn.Module):
         freqs_cos = rc[pack_idx].unsqueeze(2)  # [BK, PACK_N, 1, head_dim]
         freqs_sin = rs[pack_idx].unsqueeze(2)
 
-        # Pad to next power of 2 for Triton attention kernel
-        pad_to = 64
+        # BLOCK_N=32 exactly matches PACK_N — no wasted attention compute
+        pad_to = 32
 
         for block in self.masked_latent_predictor:
             packed_x = block(
