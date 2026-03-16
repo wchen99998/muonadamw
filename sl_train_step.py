@@ -50,7 +50,7 @@ def _get_compiled_forward_augmented(model):
     if compiled is None:
         compiled = torch.compile(
             model.forward_augmented,
-            mode="max-autotune",
+            mode="reduce-overhead",
         )
         model._compiled_forward_augmented = compiled
     return compiled
