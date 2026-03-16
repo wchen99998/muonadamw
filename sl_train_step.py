@@ -6,6 +6,9 @@ Together they form the complete optimization target.
 """
 
 import torch
+import torch._inductor.config as _inductor_config
+
+_inductor_config.aggressive_fusion = True
 
 
 class _CUDAGraphRunner:
