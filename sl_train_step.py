@@ -9,6 +9,7 @@ import torch
 import torch._inductor.config as _inductor_config
 
 _inductor_config.aggressive_fusion = True
+_inductor_config.max_autotune_gemm_backends = "TRITON"
 
 
 class _CUDAGraphRunner:
