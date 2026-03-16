@@ -6,10 +6,6 @@ Together they form the complete optimization target.
 """
 
 import torch
-import torch._inductor.config as _inductor_config
-
-_inductor_config.coordinate_descent_tuning = True
-_inductor_config.max_autotune_pointwise = True
 
 
 class _CUDAGraphRunner:
