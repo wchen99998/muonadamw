@@ -10,7 +10,7 @@ scheduler, and EMA — all as one self-contained benchmark target.
 ## Environment
 
 - **Working directory**: `~/muonadamw` — all commands run from here.
-- **Python**: `.venv/bin/python` — always use this exact path.
+- **Python**: `~/muonadamw/.venv/bin/python` — always use this exact path.
   The system `python` / `python3` will not work. Do not use `uv run`.
 - **PyTorch 2.10.0+cu130**, **Triton 3.6.0**, **Python 3.12**, **CUDA 13.0**
 - **GPU**: NVIDIA H100 NVL (96 GB)
@@ -18,7 +18,7 @@ scheduler, and EMA — all as one self-contained benchmark target.
 **Shorthand**:
 
 ```bash
-PY=~/.venv/bin/python
+PY=~/muonadamw/.venv/bin/python
 ```
 
 ---
