@@ -1020,11 +1020,15 @@ class PeakSetSIGReg(nn.Module):
         B, N = peak_mz.shape
         K = self.jepa_num_target_blocks
         # Single full-view forward pass (visible_mask = peak_valid_mask)
+        # pack_n=64 since all valid tokens (up to 64) must be visible
         teacher_full = self._teacher_encoder_forward(
             peak_mz,
             peak_intensity,
             valid_mask=peak_valid_mask,
             visible_mask=peak_valid_mask,
+            pack_n=64,
+            prefix_pack=True,
+            pad_to=64,
         )
         # Expand to K views and make contiguous for CUDA graph compatibility
         return teacher_full.unsqueeze(1).expand(-1, K, -1, -1).contiguous()
@@ -1062,6 +1066,9 @@ class PeakSetSIGReg(nn.Module):
                     peak_intensity,
                     valid_mask=peak_valid_mask,
                     visible_mask=peak_valid_mask,
+                    pack_n=64,
+                    prefix_pack=True,
+                    pad_to=64,
                 ).detach()
             target_token_target = teacher_full.unsqueeze(1).expand(-1, K, -1, -1)
         else:
@@ -1072,6 +1079,9 @@ class PeakSetSIGReg(nn.Module):
                     peak_intensity,
                     valid_mask=peak_valid_mask,
                     visible_mask=peak_valid_mask,
+                    pack_n=64,
+                    prefix_pack=True,
+                    pad_to=64,
                 ).detach()
             target_token_target = teacher_full.unsqueeze(1).expand(-1, K, -1, -1)
 
