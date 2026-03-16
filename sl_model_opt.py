@@ -300,6 +300,7 @@ class Attention(nn.Module):
         freqs_sin: torch.Tensor | None = None,
         vis_mask: torch.Tensor | None = None,
         pad_to: int = 0,
+        use_sdpa_mask: bool = False,
     ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
         qkv = self.wqkv(x)
@@ -333,9 +334,19 @@ class Attention(nn.Module):
             xk = xk.repeat_interleave(rep, dim=2)
             xv = xv.repeat_interleave(rep, dim=2)
 
-        if vis_mask is not None:
+        if vis_mask is not None and not use_sdpa_mask:
             attn = masked_attention(xq, xk, xv, vis_mask, block_n=pad_to)
             attn = attn.reshape(bsz, seqlen, self.dim)
+        elif vis_mask is not None and use_sdpa_mask:
+            # Use SDPA with bool mask — efficient for full-view attention
+            q = xq.transpose(1, 2)
+            k = xk.transpose(1, 2)
+            v = xv.transpose(1, 2)
+            # Build [B, 1, N, N] attention mask from [B, N] vis_mask
+            attn_mask = vis_mask.unsqueeze(1) & vis_mask.unsqueeze(2)  # [B, N, N]
+            attn_mask = attn_mask.unsqueeze(1)  # [B, 1, N, N]
+            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            attn = attn.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
         else:
             q = xq.transpose(1, 2)
             k = xk.transpose(1, 2)
@@ -402,6 +413,7 @@ class TransformerBlock(nn.Module):
         freqs_sin: torch.Tensor | None,
         vis_mask: torch.Tensor | None = None,
         pad_to: int = 0,
+        use_sdpa_mask: bool = False,
     ) -> torch.Tensor:
         h = x + self.attention(
             self.attention_norm(x),
@@ -409,6 +421,7 @@ class TransformerBlock(nn.Module):
             freqs_sin=freqs_sin,
             vis_mask=vis_mask,
             pad_to=pad_to,
+            use_sdpa_mask=use_sdpa_mask,
         )
         return h + self.feed_forward(self.ffn_norm(h))
 
@@ -601,6 +614,7 @@ class PeakSetEncoder(nn.Module):
         pack_n: int = 32,
         prefix_pack: bool = False,
         pad_to: int = 0,
+        use_sdpa_mask: bool = False,
     ) -> torch.Tensor:
         if visible_mask is not None and valid_mask is not None:
             vis = visible_mask & valid_mask
@@ -630,7 +644,7 @@ class PeakSetEncoder(nn.Module):
                     freqs_cos = freqs_sin = None
 
                 for block in self.blocks:
-                    x = block(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin, vis_mask=vis, pad_to=pad_to)
+                    x = block(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin, vis_mask=vis, pad_to=pad_to, use_sdpa_mask=use_sdpa_mask)
 
                 # Pad back to original N with zeros (autograd-compatible)
                 return F.pad(x, (0, 0, 0, N - PACK_N))
@@ -1021,6 +1035,7 @@ class PeakSetSIGReg(nn.Module):
         K = self.jepa_num_target_blocks
         # Single full-view forward pass (visible_mask = peak_valid_mask)
         # pack_n=64 since all valid tokens (up to 64) must be visible
+        # use_sdpa_mask=True for efficient SDPA attention (no custom Triton kernel)
         teacher_full = self._teacher_encoder_forward(
             peak_mz,
             peak_intensity,
@@ -1029,6 +1044,7 @@ class PeakSetSIGReg(nn.Module):
             pack_n=64,
             prefix_pack=True,
             pad_to=64,
+            use_sdpa_mask=True,
         )
         # Expand to K views (expanded view is fine with CUDA graphs)
         return teacher_full.unsqueeze(1).expand(-1, K, -1, -1)
