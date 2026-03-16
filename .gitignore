@@ -9,3 +9,5 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
+
+sl_data/

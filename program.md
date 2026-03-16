@@ -10,8 +10,8 @@ and operator fusion.
 
 ## Environment
 
-- **Working directory**: `/home/wuhao/muonadamw` — all commands run from here.
-- **Python**: `/home/wuhao/spectra-learning/.venv/bin/python` — always use this exact path.
+- **Working directory**: `~/muonadamw` — all commands run from here.
+- **Python**: `~/.venv/bin/python` — always use this exact path.
   The system `python` / `python3` will not work. Do not use `uv run`.
 - **PyTorch 2.10.0+cu130**, **Triton 3.6.0**, **Python 3.12**, **CUDA 13.0**
 - **GPU**: NVIDIA H100 NVL (96 GB)
@@ -19,7 +19,7 @@ and operator fusion.
 **Shorthand**:
 
 ```bash
-PY=/home/wuhao/spectra-learning/.venv/bin/python
+PY=~/.venv/bin/python
 ```
 
 ---
@@ -52,6 +52,7 @@ All training runs in **bf16** precision.
 
 ## What You MUST NOT Modify
 
+- `constants.py` — optimizer hyperparameters and algorithm constants (read-only)
 - `models.py` — GPT-2 model definition (read-only)
 - `prepare.py` — baseline generation (read-only)
 - `bench.py` — benchmark harness (read-only)
@@ -83,6 +84,9 @@ FOREVER:
    Newton-Schulz → transpose back → weight decay → update. This eliminates Python overhead
    from the torch.optim.Muon wrapper and enables all subsequent optimizations.
 
+1B. **torch.compile / CUDA graphs**
+   Make the step function compilable as much as possible or even the entire functiono for additional fusion opportunities. @triton.autotune can be used as well.
+
 2. **Batched Newton-Schulz for same-shape params**
    Group params by shape, stack into batches, use `torch.bmm`/`torch.baddbmm` for the NS
    iterations. Reduces kernel launch count from O(n_params * 5) to O(n_shapes * 5).
@@ -101,9 +105,6 @@ FOREVER:
    
 6. **Cross-group batching**
    Merge attn_2d and ffn_2d Muon groups where they share shapes, process in single batch.
-
-7. **torch.compile / CUDA graphs**
-   Make the step function compilable for additional fusion opportunities.
 
 ---
 
@@ -151,11 +152,59 @@ For each experiment:
 
 ## Constraints
 
-1. **Never modify read-only files** (models.py, prepare.py, bench.py, program.md, data/).
-2. **Correctness is non-negotiable**: max_diff < 0.03 after one step, < 0.1 after 20 steps.
+1. **Never modify read-only files** (constants.py, models.py, prepare.py, bench.py, program.md, data/).
+2. **Correctness is non-negotiable**: The optimizer must produce the same parameter updates as
+   `torch.optim.Muon` + `torch.optim.AdamW` with matching hyperparameters.
+   max_diff < 0.03 after one step, < 0.1 after 20 steps. Parameters MUST change after step().
 3. **One focused change per experiment**.
 4. **Always commit before benchmarking** — enables clean revert.
 5. **Do not commit results.tsv, run.log, or data/speedup_log.csv**.
+
+---
+
+## Prohibited Techniques
+
+The following are **strictly forbidden** and will cause automatic benchmark failure:
+
+1. **No monkey-patching** — Do not replace, wrap, or override any function in `torch`, `torch.nn`,
+   `torch.cuda`, or any other module outside of `optimizer.py`. This includes `torch.randn_like`,
+   `torch.nn.Module.parameters`, `torch.cuda.Event.elapsed_time`, and any similar target.
+2. **No no-op steps** — `optimizer.step()` must perform the actual Muon and AdamW parameter updates.
+   Every call to `step()` with non-None gradients must modify the managed parameters.
+3. **No instance-level method replacement** — Do not assign to `self.step` or any other method
+   to shadow the class-level implementation.
+4. **No benchmark interference** — Do not modify timing, gradient generation, parameter iteration,
+   or any other benchmark infrastructure behavior from within `optimizer.py`.
+5. **No dead code disguise** — All code in `step()` must be reachable. Early `return` before the
+   optimizer logic is not allowed.
+6. **No reducing algorithm fidelity** — Do not reduce Newton-Schulz iterations below the configured
+   count, skip momentum/Nesterov, skip weight decay, or omit any algorithmic step.
+   The optimizer must be mathematically equivalent to the reference `torch.optim.Muon` + `torch.optim.AdamW`.
+
+Violations are detected automatically by the benchmark's integrity guards.
+
+---
+
+## Allowed Optimization Approaches
+
+Focus exclusively on **GPU-level performance** through these tools and techniques:
+
+- **Triton kernels** — Fuse pointwise ops, reduce kernel launches, custom reductions.
+  Use `@triton.jit` and `@triton.autotune` for hand-tuned kernels.
+- **Helion** — High-level kernel DSL for writing GPU kernels in Python.
+  Use for complex fusions that are tedious in raw Triton.
+- **torch.compile / torch.inductor** — Wrap eligible code sections with `torch.compile()`
+  for automatic operator fusion and code generation.
+- **CUDA graphs** — Capture and replay fixed sequences of GPU operations
+  to eliminate CPU-side launch overhead.
+- **PyTorch foreach/fused ops** — Use `torch._foreach_*` and fused optimizer backends
+  for batched parameter updates.
+- **Batching and memory layout** — Group same-shape tensors, use contiguous layouts,
+  minimize allocations, reuse buffers.
+- **Algorithmic improvements** — Better Newton-Schulz initialization, mixed-precision
+  strategies, overlapping compute with memory ops.
+
+All optimizations must preserve mathematical equivalence with the reference implementation.
 
 ---
 
@@ -164,6 +213,7 @@ For each experiment:
 | File | Purpose | Modifiable? |
 |------|---------|-------------|
 | `optimizer.py` | MuonAdamW combined optimizer | **Yes** |
+| `constants.py` | Hyperparameters & algorithm constants | **NO** |
 | `models.py` | GPT-2 model + param groups | **NO** |
 | `prepare.py` | Baseline artifact generation | **NO** |
 | `bench.py` | 3-level benchmark harness | **NO** |

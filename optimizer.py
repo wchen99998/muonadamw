@@ -18,43 +18,38 @@ from torch.optim.adamw import adamw as _adamw
 import triton
 import triton.language as tl
 
+from constants import (
+    DEFAULT_HYPERS,
+    MUON_EPS,
+    MUON_NS_COEFFICIENTS,
+    MUON_NS_STEPS,
+    MUON_A,
+    MUON_B,
+    MUON_C,
+    MUON_MOMENTUM_BLOCK_SIZE,
+    MUON_MOMENTUM_NUM_WARPS,
+    MUON_WEIGHT_UPDATE_BLOCK_M,
+    MUON_WEIGHT_UPDATE_BLOCK_N,
+    MUON_WEIGHT_UPDATE_NUM_WARPS,
+    ADAMW_EPS,
+)
 
-# Default hyperparameters per group
-DEFAULT_HYPERS = {
-    "attn_2d": {
-        "optimizer": "muon",
-        "lr": 3e-4,
-        "momentum": 0.95,
-        "weight_decay": 0.01,
-        "nesterov": True,
-    },
-    "ffn_2d": {
-        "optimizer": "muon",
-        "lr": 1e-4,
-        "momentum": 0.90,
-        "weight_decay": 0.05,
-        "nesterov": True,
-    },
-    "non_2d": {
-        "optimizer": "adamw",
-        "lr": 1e-3,
-        "weight_decay": 0.01,
-        "betas": (0.9, 0.999),
-    },
-}
+_MUON_MOMENTUM_AUTOTUNE_CONFIGS = [
+    triton.Config(
+        {"BLOCK_SIZE": MUON_MOMENTUM_BLOCK_SIZE},
+        num_warps=MUON_MOMENTUM_NUM_WARPS,
+    ),
+    triton.Config({"BLOCK_SIZE": MUON_MOMENTUM_BLOCK_SIZE}, num_warps=4),
+    triton.Config({"BLOCK_SIZE": 2048}, num_warps=4),
+    triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
+]
 
-MUON_EPS = 1e-7
-MUON_NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
-MUON_NS_STEPS = 5
-MUON_A, MUON_B, MUON_C = MUON_NS_COEFFICIENTS
-MUON_MOMENTUM_BLOCK_SIZE = 1024
-MUON_MOMENTUM_NUM_WARPS = 8
-MUON_WEIGHT_UPDATE_BLOCK_M = 32
-MUON_WEIGHT_UPDATE_BLOCK_N = 64
-MUON_WEIGHT_UPDATE_NUM_WARPS = 4
-ADAMW_EPS = 1e-8
+_MUON_GENERIC_WEIGHT_UPDATE_BLOCK_M = 64
+_MUON_GENERIC_WEIGHT_UPDATE_BLOCK_N = 64
+_MUON_GENERIC_WEIGHT_UPDATE_NUM_WARPS = 4
 
 
+@triton.autotune(configs=_MUON_MOMENTUM_AUTOTUNE_CONFIGS, key=["numel", "nesterov"])
 @triton.jit
 def _fused_muon_momentum_nesterov_kernel(
     grad_ptr,
@@ -232,11 +227,49 @@ def _batched_default_zeropower_eager(
     return ortho_grads
 
 
+def _batched_default_transposed_zeropower_eager(
+    ortho_grads: Tensor,
+    eps: float,
+) -> Tensor:
+    ortho_grads = ortho_grads.transpose(1, 2)
+
+    norms = ortho_grads.flatten(1).norm(dim=1).clamp(min=eps).view(-1, 1, 1)
+    ortho_grads = ortho_grads / norms
+
+    for _ in range(MUON_NS_STEPS):
+        gram_matrix = torch.bmm(ortho_grads, ortho_grads.transpose(1, 2))
+        gram_update = MUON_B * gram_matrix + MUON_C * torch.bmm(gram_matrix, gram_matrix)
+        ortho_grads = MUON_A * ortho_grads + torch.bmm(gram_update, ortho_grads)
+
+    return ortho_grads.transpose(1, 2)
+
+
 _batched_default_zeropower = torch.compile(
     _batched_default_zeropower_eager,
     fullgraph=True,
     dynamic=False,
     mode="reduce-overhead",
+)
+
+_batched_default_zeropower_nocg = torch.compile(
+    _batched_default_zeropower_eager,
+    fullgraph=True,
+    dynamic=False,
+    options={"triton.cudagraphs": False},
+)
+
+_batched_default_transposed_zeropower = torch.compile(
+    _batched_default_transposed_zeropower_eager,
+    fullgraph=True,
+    dynamic=False,
+    mode="max-autotune",
+)
+
+_batched_default_transposed_zeropower_nocg = torch.compile(
+    _batched_default_transposed_zeropower_eager,
+    fullgraph=True,
+    dynamic=False,
+    mode="max-autotune-no-cudagraphs",
 )
 
 
@@ -251,6 +284,8 @@ def _batched_zeropower_tensor(
         ns_coefficients == MUON_NS_COEFFICIENTS
         and ns_steps == MUON_NS_STEPS
     ):
+        if transposed:
+            return _batched_default_transposed_zeropower(ortho_grads, eps)
         return _batched_default_zeropower(ortho_grads, transposed, eps)
 
     a, b, c = ns_coefficients
@@ -268,6 +303,206 @@ def _batched_zeropower_tensor(
     if transposed:
         ortho_grads = ortho_grads.transpose(1, 2)
     return ortho_grads
+
+
+def _run_graphable_default_muon_bucket(
+    bucket: dict,
+    momentum: float,
+    nesterov: bool,
+    wd_factor: float,
+    eps: float,
+):
+    numel = bucket["batch_buffer"].numel()
+    _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
+        bucket["batch_buffer"],
+        bucket["momentum_batch"],
+        numel,
+        momentum,
+        nesterov=nesterov,
+    )
+    if bucket["transposed"]:
+        ortho_updates = _batched_default_transposed_zeropower_nocg(
+            bucket["batch_buffer"],
+            eps,
+        )
+    else:
+        ortho_updates = _batched_default_zeropower_nocg(
+            bucket["batch_buffer"],
+            False,
+            eps,
+        )
+
+    if bucket["use_triton_weight_update_contig"]:
+        _fused_muon_weight_update_ptr_contig_kernel[bucket["weight_update_grid"]](
+            bucket["param_ptrs"],
+            ortho_updates,
+            wd_factor,
+            -bucket["adjusted_lr"],
+            ROWS=bucket["rows"],
+            COLS=bucket["cols"],
+            BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
+            BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
+            num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
+        )
+    else:
+        _fused_muon_weight_update_ptr_kernel[bucket["weight_update_grid"]](
+            bucket["param_ptrs"],
+            ortho_updates,
+            ortho_updates.stride(0),
+            ortho_updates.stride(1),
+            ortho_updates.stride(2),
+            bucket["rows"],
+            bucket["cols"],
+            bucket["param_stride0"],
+            bucket["param_stride1"],
+            wd_factor,
+            -bucket["adjusted_lr"],
+            BLOCK_M=_MUON_GENERIC_WEIGHT_UPDATE_BLOCK_M,
+            BLOCK_N=_MUON_GENERIC_WEIGHT_UPDATE_BLOCK_N,
+            num_warps=_MUON_GENERIC_WEIGHT_UPDATE_NUM_WARPS,
+        )
+
+
+def _replay_or_capture_default_muon_bucket(
+    bucket: dict,
+    momentum: float,
+    nesterov: bool,
+    wd_factor: float,
+    eps: float,
+):
+    graph = bucket.get("cudagraph")
+    if graph is None:
+        param_copies = [param.clone() for param in bucket["params"]]
+        momentum_copy = bucket["momentum_batch"].clone()
+        batch_copy = bucket["batch_buffer"].clone()
+
+        # Warm up compile/autotune before capture so replay is stable.
+        _run_graphable_default_muon_bucket(
+            bucket,
+            momentum=momentum,
+            nesterov=nesterov,
+            wd_factor=wd_factor,
+            eps=eps,
+        )
+        for param, copy in zip(bucket["params"], param_copies):
+            param.copy_(copy)
+        bucket["momentum_batch"].copy_(momentum_copy)
+        bucket["batch_buffer"].copy_(batch_copy)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _run_graphable_default_muon_bucket(
+                bucket,
+                momentum=momentum,
+                nesterov=nesterov,
+                wd_factor=wd_factor,
+                eps=eps,
+            )
+        for param, copy in zip(bucket["params"], param_copies):
+            param.copy_(copy)
+        bucket["momentum_batch"].copy_(momentum_copy)
+        bucket["batch_buffer"].copy_(batch_copy)
+        bucket["cudagraph"] = graph
+
+    graph.replay()
+
+
+def _run_graphable_default_muon_group(group: dict):
+    for bucket in group["shape_buckets"]:
+        _run_graphable_default_muon_bucket(
+            bucket,
+            momentum=group["momentum"],
+            nesterov=group["nesterov"],
+            wd_factor=1 - group["lr"] * group["weight_decay"],
+            eps=group["eps"],
+        )
+
+
+def _replay_or_capture_default_muon_group(group: dict):
+    graph = group.get("cudagraph")
+    if graph is None:
+        buckets = group["shape_buckets"]
+        param_copies = [param.clone() for param in group["params"]]
+        momentum_copies = [bucket["momentum_batch"].clone() for bucket in buckets]
+        batch_copies = [bucket["batch_buffer"].clone() for bucket in buckets]
+
+        _run_graphable_default_muon_group(group)
+        for param, copy in zip(group["params"], param_copies):
+            param.copy_(copy)
+        for bucket, copy in zip(buckets, momentum_copies):
+            bucket["momentum_batch"].copy_(copy)
+        for bucket, copy in zip(buckets, batch_copies):
+            bucket["batch_buffer"].copy_(copy)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _run_graphable_default_muon_group(group)
+        for param, copy in zip(group["params"], param_copies):
+            param.copy_(copy)
+        for bucket, copy in zip(buckets, momentum_copies):
+            bucket["momentum_batch"].copy_(copy)
+        for bucket, copy in zip(buckets, batch_copies):
+            bucket["batch_buffer"].copy_(copy)
+        group["cudagraph"] = graph
+
+    graph.replay()
+
+
+def _run_graphable_adamw_group(group: dict):
+    beta1, beta2 = group["betas"]
+    _adamw(
+        group["params"],
+        group["grad_buffers"],
+        group["exp_avgs"],
+        group["exp_avg_sqs"],
+        [],
+        group["state_steps"],
+        fused=True,
+        amsgrad=False,
+        beta1=beta1,
+        beta2=beta2,
+        lr=group["lr"],
+        weight_decay=group["weight_decay"],
+        eps=group["eps"],
+        maximize=False,
+        capturable=True,
+        differentiable=False,
+        has_complex=group["has_complex"],
+    )
+
+
+def _replay_or_capture_adamw_group(group: dict):
+    graph = group.get("cudagraph")
+    if graph is None:
+        param_copies = [param.clone() for param in group["params"]]
+        exp_avg_copies = [exp_avg.clone() for exp_avg in group["exp_avgs"]]
+        exp_avg_sq_copies = [exp_avg_sq.clone() for exp_avg_sq in group["exp_avg_sqs"]]
+        state_step_copies = [state_step.clone() for state_step in group["state_steps"]]
+
+        _run_graphable_adamw_group(group)
+        for param, copy in zip(group["params"], param_copies):
+            param.copy_(copy)
+        for exp_avg, copy in zip(group["exp_avgs"], exp_avg_copies):
+            exp_avg.copy_(copy)
+        for exp_avg_sq, copy in zip(group["exp_avg_sqs"], exp_avg_sq_copies):
+            exp_avg_sq.copy_(copy)
+        for state_step, copy in zip(group["state_steps"], state_step_copies):
+            state_step.copy_(copy)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _run_graphable_adamw_group(group)
+        for param, copy in zip(group["params"], param_copies):
+            param.copy_(copy)
+        for exp_avg, copy in zip(group["exp_avgs"], exp_avg_copies):
+            exp_avg.copy_(copy)
+        for exp_avg_sq, copy in zip(group["exp_avg_sqs"], exp_avg_sq_copies):
+            exp_avg_sq.copy_(copy)
+        for state_step, copy in zip(group["state_steps"], state_step_copies):
+            state_step.copy_(copy)
+        group["cudagraph"] = graph
+
+    graph.replay()
 
 
 class MuonAdamW:
@@ -288,6 +523,7 @@ class MuonAdamW:
         self._adamw_groups = []
         self._adamw_params = []
         self._adamw_state: dict[Tensor, dict[str, Tensor]] = {}
+        self._adamw_stream: torch.cuda.Stream | None = None
 
         for group in param_groups:
             name = group["name"]
@@ -372,7 +608,9 @@ class MuonAdamW:
                     momentum_batch = torch.zeros_like(batch_buffer)
                     bucket["batch_buffer"] = batch_buffer
                     bucket["momentum_grid"] = (
-                        triton.cdiv(batch_buffer.numel(), MUON_MOMENTUM_BLOCK_SIZE),
+                        lambda meta, numel=batch_buffer.numel(): (
+                            triton.cdiv(numel, meta["BLOCK_SIZE"]),
+                        )
                     )
                     bucket["batch_views"] = [batch_buffer[i] for i in range(batch_buffer.size(0))]
                     bucket["momentum_batch"] = momentum_batch
@@ -381,8 +619,18 @@ class MuonAdamW:
                     ]
                     bucket["weight_update_grid"] = (
                         len(bucket["params"]),
-                        triton.cdiv(bucket["rows"], MUON_WEIGHT_UPDATE_BLOCK_M),
-                        triton.cdiv(bucket["cols"], MUON_WEIGHT_UPDATE_BLOCK_N),
+                        triton.cdiv(
+                            bucket["rows"],
+                            _MUON_GENERIC_WEIGHT_UPDATE_BLOCK_M
+                            if not bucket["use_triton_weight_update_contig"]
+                            else MUON_WEIGHT_UPDATE_BLOCK_M,
+                        ),
+                        triton.cdiv(
+                            bucket["cols"],
+                            _MUON_GENERIC_WEIGHT_UPDATE_BLOCK_N
+                            if not bucket["use_triton_weight_update_contig"]
+                            else MUON_WEIGHT_UPDATE_BLOCK_N,
+                        ),
                     )
                     if bucket["use_triton_weight_update"]:
                         bucket["param_ptrs"] = torch.tensor(
@@ -408,6 +656,7 @@ class MuonAdamW:
                     "eps": group.get("eps", ADAMW_EPS),
                     "has_complex": any(torch.is_complex(param) for param in params),
                     "grads": [None] * len(params),
+                    "grad_buffers": [torch.empty_like(param) for param in params],
                     "exp_avgs": [],
                     "exp_avg_sqs": [],
                     "state_steps": [],
@@ -429,6 +678,9 @@ class MuonAdamW:
                 self._adamw_groups.append(adamw_group)
                 self._adamw_params.extend(params)
 
+        if self._adamw_params and self._adamw_params[0].device.type == "cuda":
+            self._adamw_stream = torch.cuda.Stream(device=self._adamw_params[0].device)
+
     @torch.no_grad()
     def step(self, closure=None):
         """Perform a single optimization step."""
@@ -436,6 +688,56 @@ class MuonAdamW:
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        adamw_stream = self._adamw_stream
+        current_stream = torch.cuda.current_stream() if adamw_stream is not None else None
+        overlapped_adamw_group = None
+        serial_adamw_groups = []
+        last_overlappable_muon_group = None
+        for group in self._adamw_groups:
+            beta1, beta2 = group["betas"]
+            grads = group["grads"]
+            all_grads_present = True
+            for idx, param in enumerate(group["params"]):
+                grad = param.grad
+                grads[idx] = grad
+                if grad is None:
+                    all_grads_present = False
+                    break
+                if grad.is_sparse:
+                    raise RuntimeError(
+                        "AdamW does not support sparse gradients, please consider SparseAdam instead"
+                    )
+            if all_grads_present:
+                if adamw_stream is None or current_stream is None:
+                    torch._foreach_copy_(group["grad_buffers"], grads)
+                    _replay_or_capture_adamw_group(group)
+                else:
+                    graph = group.get("cudagraph")
+                    if graph is None:
+                        torch._foreach_copy_(group["grad_buffers"], grads)
+                        _replay_or_capture_adamw_group(group)
+                    else:
+                        adamw_stream.wait_stream(current_stream)
+                        with torch.cuda.stream(adamw_stream):
+                            torch._foreach_copy_(group["grad_buffers"], grads)
+                        overlapped_adamw_group = group
+                continue
+            serial_adamw_groups.append(group)
+
+        if overlapped_adamw_group is not None:
+            for group in self._muon_groups:
+                if all(param.grad is not None for param in group["params"]):
+                    default_group_graph_eligible = (
+                        group["ns_coefficients"] == MUON_NS_COEFFICIENTS
+                        and group["ns_steps"] == MUON_NS_STEPS
+                        and all(
+                            bucket["use_triton_weight_update"]
+                            for bucket in group["shape_buckets"]
+                        )
+                    )
+                    if default_group_graph_eligible:
+                        last_overlappable_muon_group = group
 
         for group in self._muon_groups:
             lr = group["lr"]
@@ -447,6 +749,41 @@ class MuonAdamW:
             ns_steps = group["ns_steps"]
             adjust_lr_fn = group["adjust_lr_fn"]
             if all(param.grad is not None for param in group["params"]):
+                default_group_graph_eligible = (
+                    ns_coefficients == MUON_NS_COEFFICIENTS
+                    and ns_steps == MUON_NS_STEPS
+                    and all(
+                        bucket["use_triton_weight_update"]
+                        for bucket in group["shape_buckets"]
+                    )
+                )
+                if default_group_graph_eligible:
+                    for bucket in group["shape_buckets"]:
+                        bucket_grads = bucket["grads"]
+                        for idx, param in enumerate(bucket["params"]):
+                            grad = param.grad
+                            bucket_grads[idx] = grad
+                            if grad.is_sparse:
+                                raise RuntimeError("Muon does not support sparse gradients")
+                        torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
+                    if (
+                        group is last_overlappable_muon_group
+                        and overlapped_adamw_group is not None
+                        and adamw_stream is not None
+                        and current_stream is not None
+                    ):
+                        with torch.cuda.stream(adamw_stream):
+                            overlapped_adamw_group["cudagraph"].replay()
+                    _replay_or_capture_default_muon_group(group)
+                    if (
+                        group is last_overlappable_muon_group
+                        and overlapped_adamw_group is not None
+                        and adamw_stream is not None
+                        and current_stream is not None
+                    ):
+                        current_stream.wait_stream(adamw_stream)
+                        overlapped_adamw_group = None
+                    continue
                 for bucket in group["shape_buckets"]:
                     bucket_grads = bucket["grads"]
                     for idx, param in enumerate(bucket["params"]):
@@ -455,6 +792,19 @@ class MuonAdamW:
                         if grad.is_sparse:
                             raise RuntimeError("Muon does not support sparse gradients")
                     torch.stack(bucket_grads, dim=0, out=bucket["batch_buffer"])
+                    if bucket["use_triton_weight_update"]:
+                        if (
+                            ns_coefficients == MUON_NS_COEFFICIENTS
+                            and ns_steps == MUON_NS_STEPS
+                        ):
+                            _replay_or_capture_default_muon_bucket(
+                                bucket,
+                                momentum=momentum,
+                                nesterov=nesterov,
+                                wd_factor=1 - lr * weight_decay,
+                                eps=eps,
+                            )
+                            continue
                     numel = bucket["batch_buffer"].numel()
                     _fused_muon_momentum_nesterov_kernel[bucket["momentum_grid"]](
                         bucket["batch_buffer"],
@@ -462,8 +812,6 @@ class MuonAdamW:
                         numel,
                         momentum,
                         nesterov=nesterov,
-                        BLOCK_SIZE=MUON_MOMENTUM_BLOCK_SIZE,
-                        num_warps=MUON_MOMENTUM_NUM_WARPS,
                     )
                     ortho_updates = _batched_zeropower_tensor(
                         bucket["batch_buffer"],
@@ -502,9 +850,9 @@ class MuonAdamW:
                                 bucket["param_stride1"],
                                 1 - lr * weight_decay,
                                 -bucket["adjusted_lr"],
-                                BLOCK_M=MUON_WEIGHT_UPDATE_BLOCK_M,
-                                BLOCK_N=MUON_WEIGHT_UPDATE_BLOCK_N,
-                                num_warps=MUON_WEIGHT_UPDATE_NUM_WARPS,
+                                BLOCK_M=_MUON_GENERIC_WEIGHT_UPDATE_BLOCK_M,
+                                BLOCK_N=_MUON_GENERIC_WEIGHT_UPDATE_BLOCK_N,
+                                num_warps=_MUON_GENERIC_WEIGHT_UPDATE_NUM_WARPS,
                             )
                     else:
                         torch._foreach_mul_(bucket["params"], 1 - lr * weight_decay)
@@ -558,7 +906,16 @@ class MuonAdamW:
                 torch._foreach_mul_(params, 1 - lr * weight_decay)
                 torch._foreach_add_(params, ortho_updates, alpha=-adjusted_lr)
 
-        for group in self._adamw_groups:
+        if (
+            overlapped_adamw_group is not None
+            and adamw_stream is not None
+            and current_stream is not None
+        ):
+            with torch.cuda.stream(adamw_stream):
+                overlapped_adamw_group["cudagraph"].replay()
+            current_stream.wait_stream(adamw_stream)
+
+        for group in serial_adamw_groups:
             beta1, beta2 = group["betas"]
             grads = group["grads"]
             all_grads_present = True
@@ -588,7 +945,7 @@ class MuonAdamW:
                     weight_decay=group["weight_decay"],
                     eps=group["eps"],
                     maximize=False,
-                    capturable=False,
+                    capturable=True,
                     differentiable=False,
                     has_complex=group["has_complex"],
                 )
@@ -636,7 +993,7 @@ class MuonAdamW:
                     weight_decay=group["weight_decay"],
                     eps=group["eps"],
                     maximize=False,
-                    capturable=False,
+                    capturable=True,
                     differentiable=False,
                     has_complex=group["has_complex"],
                 )
