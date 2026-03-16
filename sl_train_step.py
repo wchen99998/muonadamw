@@ -60,16 +60,12 @@ def _get_compiled_forward_augmented(model):
     return compiled
 
 
-def _get_compiled_teacher(model):
-    compiled = getattr(model, "_compiled_teacher", None)
-    if compiled is None:
-        compiled = torch.compile(
-            model.compute_teacher_targets,
-            mode="reduce-overhead",
-            dynamic=False,
-        )
-        model._compiled_teacher = compiled
-    return compiled
+def _get_teacher_runner(model):
+    runner = getattr(model, "_teacher_graph_runner", None)
+    if runner is None:
+        runner = _CUDAGraphRunner(compile_kwargs={"mode": "max-autotune-no-cudagraphs", "dynamic": False})
+        model._teacher_graph_runner = runner
+    return runner
 
 
 def _get_trainable_params(model):
@@ -84,12 +80,11 @@ def train_step(model, batch, optimizer, autocast_dtype, grad_clip_norm):
     """One complete training step. Returns metrics dict."""
     model.advance_sigreg_lambda_schedule()
 
-    # Compute teacher targets (no grad, compiled with reduce-overhead CUDA graphs)
+    # Compute teacher targets (no grad, explicit CUDA graph — no clone needed)
     if model.teacher_encoder is not None:
-        torch.compiler.cudagraph_mark_step_begin()
-        compiled_teacher = _get_compiled_teacher(model)
+        runner = _get_teacher_runner(model)
         with torch.autocast("cuda", dtype=autocast_dtype):
-            teacher_targets = compiled_teacher(batch)
+            teacher_targets = runner.run(model.compute_teacher_targets, batch)
     else:
         teacher_targets = None
 
