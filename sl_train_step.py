@@ -51,10 +51,6 @@ def _get_compiled_forward_augmented(model):
         compiled = torch.compile(
             model.forward_augmented,
             mode="max-autotune",
-            options={
-                "coordinate_descent_tuning": True,
-                "aggressive_fusion": True,
-            },
         )
         model._compiled_forward_augmented = compiled
     return compiled
@@ -63,13 +59,7 @@ def _get_compiled_forward_augmented(model):
 def _get_teacher_runner(model):
     runner = getattr(model, "_teacher_graph_runner", None)
     if runner is None:
-        runner = _CUDAGraphRunner(compile_kwargs={
-            "mode": "max-autotune-no-cudagraphs",
-            "options": {
-                "coordinate_descent_tuning": True,
-                "aggressive_fusion": True,
-            },
-        })
+        runner = _CUDAGraphRunner(compile_kwargs={"mode": "max-autotune-no-cudagraphs"})
         model._teacher_graph_runner = runner
     return runner
 
