@@ -23,12 +23,9 @@ import triton.language as tl
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=2, num_stages=2),
-        triton.Config({}, num_warps=2, num_stages=3),
         triton.Config({}, num_warps=4, num_stages=2),
         triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=4, num_stages=4),
         triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=3),
     ],
     key=["BLOCK_N", "D"],
 )
@@ -92,12 +89,9 @@ def _masked_attn_fwd_kernel(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=2, num_stages=2),
-        triton.Config({}, num_warps=2, num_stages=3),
         triton.Config({}, num_warps=4, num_stages=2),
         triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=4, num_stages=4),
         triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=3),
     ],
     key=["BLOCK_N", "D"],
 )
