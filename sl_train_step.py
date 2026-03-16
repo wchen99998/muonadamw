@@ -57,44 +57,12 @@ def _get_compiled_forward_augmented(model):
     return compiled
 
 
-def _get_compiled_context_encoder(model):
-    compiled = getattr(model, "_compiled_context_encoder", None)
-    if compiled is None:
-        compiled = torch.compile(
-            model.compute_context_emb,
-            mode="max-autotune-no-cudagraphs",
-            dynamic=False,
-        )
-        model._compiled_context_encoder = compiled
-    return compiled
-
-
-def _get_compiled_predictor_loss(model):
-    compiled = getattr(model, "_compiled_predictor_loss", None)
-    if compiled is None:
-        compiled = torch.compile(
-            model.forward_predictor_loss,
-            mode="max-autotune-no-cudagraphs",
-            dynamic=False,
-        )
-        model._compiled_predictor_loss = compiled
-    return compiled
-
-
 def _get_teacher_runner(model):
     runner = getattr(model, "_teacher_graph_runner", None)
     if runner is None:
         runner = _CUDAGraphRunner(compile_kwargs={"mode": "max-autotune-no-cudagraphs", "dynamic": False})
         model._teacher_graph_runner = runner
     return runner
-
-
-def _get_teacher_stream():
-    stream = getattr(_get_teacher_stream, "_stream", None)
-    if stream is None:
-        stream = torch.cuda.Stream()
-        _get_teacher_stream._stream = stream
-    return stream
 
 
 def _get_trainable_params(model):
@@ -109,36 +77,19 @@ def train_step(model, batch, optimizer, autocast_dtype, grad_clip_norm):
     """One complete training step. Returns metrics dict."""
     model.advance_sigreg_lambda_schedule()
 
+    # Compute teacher targets (no grad, explicit CUDA graph — no clone needed)
     if model.teacher_encoder is not None:
-        # Overlap teacher CUDA graph with student context encoder
-        teacher_stream = _get_teacher_stream()
         runner = _get_teacher_runner(model)
-        main_stream = torch.cuda.current_stream()
-
-        # Launch teacher on side stream
-        teacher_stream.wait_stream(main_stream)
-        with torch.cuda.stream(teacher_stream):
-            with torch.autocast("cuda", dtype=autocast_dtype):
-                teacher_targets = runner.run(model.compute_teacher_targets, batch)
-
-        # Run context encoder on main stream (overlapped with teacher)
-        compiled_encoder = _get_compiled_context_encoder(model)
         with torch.autocast("cuda", dtype=autocast_dtype):
-            context_emb = compiled_encoder(batch)
-
-        # Wait for teacher to finish before predictor+loss
-        main_stream.wait_stream(teacher_stream)
-
-        # Run predictor + loss on main stream
-        compiled_pred_loss = _get_compiled_predictor_loss(model)
-        with torch.autocast("cuda", dtype=autocast_dtype):
-            metrics = compiled_pred_loss(batch, context_emb, teacher_targets)
+            teacher_targets = runner.run(model.compute_teacher_targets, batch)
     else:
-        # No teacher — use original single-compile path
-        torch.compiler.cudagraph_mark_step_begin()
-        forward_augmented = _get_compiled_forward_augmented(model)
-        with torch.autocast("cuda", dtype=autocast_dtype):
-            metrics = forward_augmented(batch, None)
+        teacher_targets = None
+
+    # Student encoder + predictor + loss (needs grad)
+    torch.compiler.cudagraph_mark_step_begin()
+    forward_augmented = _get_compiled_forward_augmented(model)
+    with torch.autocast("cuda", dtype=autocast_dtype):
+        metrics = forward_augmented(batch, teacher_targets)
 
     metrics["loss"].backward()
     if grad_clip_norm and grad_clip_norm > 0:
