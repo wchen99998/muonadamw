@@ -51,7 +51,6 @@ def _get_compiled_forward_augmented(model):
         compiled = torch.compile(
             model.forward_augmented,
             mode="max-autotune",
-            fullgraph=True,
         )
         model._compiled_forward_augmented = compiled
     return compiled
