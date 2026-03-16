@@ -45,58 +45,6 @@ class _CUDAGraphRunner:
         return self.static_output
 
 
-class _FwdBwdClipGraphRunner:
-    """CUDA graph for compiled forward + backward + grad clip as one unit.
-
-    Eliminates inter-operation overhead between forward, backward, and
-    gradient clipping by capturing them all in a single CUDA graph.
-    """
-
-    def __init__(self):
-        self.graph = None
-        self.static_metrics = None
-        self.compiled_fwd = None
-
-    def run(self, model, batch, teacher_targets, autocast_dtype, grad_clip_norm, trainable_params):
-        if self.graph is None:
-            # Compile forward without CUDA graphs (we'll wrap in our own graph)
-            if self.compiled_fwd is None:
-                self.compiled_fwd = torch.compile(
-                    model.forward_augmented,
-                    mode="max-autotune-no-cudagraphs",
-                )
-
-            # Warmup
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                for _ in range(3):
-                    with torch.autocast("cuda", dtype=autocast_dtype):
-                        m = self.compiled_fwd(batch, teacher_targets)
-                    m["loss"].backward()
-                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip_norm)
-            torch.cuda.current_stream().wait_stream(s)
-
-            # Capture forward + backward + grad clip as one graph
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                with torch.autocast("cuda", dtype=autocast_dtype):
-                    self.static_metrics = self.compiled_fwd(batch, teacher_targets)
-                self.static_metrics["loss"].backward()
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip_norm)
-
-        self.graph.replay()
-        return self.static_metrics
-
-
-def _get_fwd_bwd_clip_runner(model):
-    runner = getattr(model, "_fwd_bwd_clip_runner", None)
-    if runner is None:
-        runner = _FwdBwdClipGraphRunner()
-        model._fwd_bwd_clip_runner = runner
-    return runner
-
-
 def _get_compiled_forward_augmented(model):
     compiled = getattr(model, "_compiled_forward_augmented", None)
     if compiled is None:
@@ -136,13 +84,18 @@ def train_step(model, batch, optimizer, autocast_dtype, grad_clip_norm):
     else:
         teacher_targets = None
 
-    # Student forward + backward + grad clip in one CUDA graph
-    trainable_params = _get_trainable_params(model)
-    fwd_bwd_runner = _get_fwd_bwd_clip_runner(model)
-    metrics = fwd_bwd_runner.run(
-        model, batch, teacher_targets, autocast_dtype, grad_clip_norm, trainable_params
-    )
+    # Student encoder + predictor + loss (needs grad)
+    torch.compiler.cudagraph_mark_step_begin()
+    forward_augmented = _get_compiled_forward_augmented(model)
+    with torch.autocast("cuda", dtype=autocast_dtype):
+        metrics = forward_augmented(batch, teacher_targets)
 
+    metrics["loss"].backward()
+    if grad_clip_norm and grad_clip_norm > 0:
+        torch.nn.utils.clip_grad_norm_(
+            _get_trainable_params(model),
+            max_norm=grad_clip_norm,
+        )
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     model.update_teacher()
