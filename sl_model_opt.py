@@ -345,92 +345,6 @@ class Attention(nn.Module):
         return self.wo(attn)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-    ],
-    key=["M", "N", "K"],
-)
-@triton.jit
-def _silu_gemm_kernel(
-    X_ptr, W_ptr, Y_ptr,
-    M, N, K,
-    stride_xm, stride_xk,
-    stride_wn, stride_wk,
-    stride_ym, stride_yn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """Y = SiLU(X) @ W^T. X: [M, K], W: [N, K], Y: [M, N]."""
-    pid = tl.program_id(0)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
-
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k_start in range(0, K, BLOCK_K):
-        rk = k_start + tl.arange(0, BLOCK_K)
-        x = tl.load(X_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
-                     mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0)
-        x_f32 = x.to(tl.float32)
-        x_silu = (x_f32 * tl.sigmoid(x_f32)).to(tl.bfloat16)
-        w = tl.load(W_ptr + rn[:, None] * stride_wn + rk[None, :] * stride_wk,
-                     mask=(rn[:, None] < N) & (rk[None, :] < K), other=0.0)
-        acc = tl.dot(x_silu, tl.trans(w), acc=acc)
-
-    result = acc.to(tl.bfloat16)
-    mask = (rm[:, None] < M) & (rn[None, :] < N)
-    tl.store(Y_ptr + rm[:, None] * stride_ym + rn[None, :] * stride_yn, result, mask=mask)
-
-
-class _FusedSiLULinearFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, h, w2_weight):
-        """Compute F.linear(silu(h), w2_weight) using fused Triton kernel."""
-        M, K = h.shape
-        N = w2_weight.shape[0]
-        y = torch.empty(M, N, device=h.device, dtype=h.dtype)
-        grid = lambda META: (
-            triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-        )
-        _silu_gemm_kernel[grid](
-            h, w2_weight, y,
-            M, N, K,
-            h.stride(0), h.stride(1),
-            w2_weight.stride(0), w2_weight.stride(1),
-            y.stride(0), y.stride(1),
-        )
-        ctx.save_for_backward(h, w2_weight)
-        return y
-
-    @staticmethod
-    def backward(ctx, dy):
-        h, w2_weight = ctx.saved_tensors
-        # silu(h) for dW2 computation
-        h_silu = torch.nn.functional.silu(h)
-        # dW2 = dy^T @ silu(h)
-        dw2 = dy.t() @ h_silu
-        # dh_silu = dy @ W2
-        dh_silu = dy @ w2_weight
-        # dh = dh_silu * silu'(h) = dh_silu * (sigmoid(h) + h * sigmoid(h) * (1 - sigmoid(h)))
-        sig_h = torch.sigmoid(h.float()).to(h.dtype)
-        dh = dh_silu * (sig_h + h * sig_h * (1 - sig_h))
-        return dh, dw2
-
-
-def _fused_silu_linear(h, w2_weight):
-    """Fused SiLU activation + linear: F.linear(silu(h), w2_weight)."""
-    return _FusedSiLULinearFunc.apply(h, w2_weight)
-
-
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -450,11 +364,7 @@ class FeedForward(nn.Module):
             nn.init.trunc_normal_(w.weight, std=1.0 / math.sqrt(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.w1(x)
-        orig_shape = h.shape
-        h_2d = h.reshape(-1, h.shape[-1])
-        out_2d = _fused_silu_linear(h_2d, self.w2.weight)
-        return out_2d.reshape(*orig_shape[:-1], out_2d.shape[-1])
+        return self.w2(torch.nn.functional.silu(self.w1(x)))
 
 
 class TransformerBlock(nn.Module):
