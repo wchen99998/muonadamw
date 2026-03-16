@@ -1009,27 +1009,25 @@ class PeakSetSIGReg(nn.Module):
         self,
         augmented_batch: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Compute teacher encoder targets. Runs under no_grad."""
+        """Compute teacher encoder targets. Runs under no_grad.
+
+        Full-view encoding: teacher sees the entire valid spectrum once,
+        result is expanded to K target views.
+        """
         peak_mz = augmented_batch["peak_mz"]
         peak_intensity = augmented_batch["peak_intensity"]
         peak_valid_mask = augmented_batch["peak_valid_mask"]
-        target_masks = augmented_batch["target_masks"] & peak_valid_mask.unsqueeze(1)
         B, N = peak_mz.shape
         K = self.jepa_num_target_blocks
-        target_peak_mz = peak_mz.repeat_interleave(K, dim=0)
-        target_peak_intensity = peak_intensity.repeat_interleave(K, dim=0)
-        target_valid_mask = peak_valid_mask.repeat_interleave(K, dim=0)
-        return (
-            self._teacher_encoder_forward(
-                target_peak_mz,
-                target_peak_intensity,
-                valid_mask=target_valid_mask,
-                visible_mask=target_masks.reshape(B * K, N),
-                pack_n=16,
-            )
-            .reshape(B, K, N, -1)
-            .detach()
+        # Single full-view forward pass (visible_mask = peak_valid_mask)
+        teacher_full = self._teacher_encoder_forward(
+            peak_mz,
+            peak_intensity,
+            valid_mask=peak_valid_mask,
+            visible_mask=peak_valid_mask,
         )
+        # Expand to K views and make contiguous for CUDA graph compatibility
+        return teacher_full.unsqueeze(1).expand(-1, K, -1, -1).contiguous()
 
     def forward_augmented(
         self,
@@ -1057,35 +1055,25 @@ class PeakSetSIGReg(nn.Module):
         if teacher_targets is not None:
             target_token_target = teacher_targets
         elif self.teacher_encoder is not None:
-            target_peak_mz = peak_mz.repeat_interleave(K, dim=0)
-            target_peak_intensity = peak_intensity.repeat_interleave(K, dim=0)
-            target_valid_mask = peak_valid_mask.repeat_interleave(K, dim=0)
+            # Full-view teacher encoding: single pass with peak_valid_mask
             with torch.no_grad():
-                target_token_target = (
-                    self._teacher_encoder_forward(
-                        target_peak_mz,
-                        target_peak_intensity,
-                        valid_mask=target_valid_mask,
-                        visible_mask=target_masks.reshape(B * K, N),
-                        pack_n=16,
-                    )
-                    .reshape(B, K, N, -1)
-                    .detach()
-                )
+                teacher_full = self._teacher_encoder_forward(
+                    peak_mz,
+                    peak_intensity,
+                    valid_mask=peak_valid_mask,
+                    visible_mask=peak_valid_mask,
+                ).detach()
+            target_token_target = teacher_full.unsqueeze(1).expand(-1, K, -1, -1)
         else:
-            # Without teacher, need student target views
-            student_visible = torch.cat([context_mask.unsqueeze(1), target_masks], dim=1)
-            student_peak_mz = peak_mz.repeat_interleave(K + 1, dim=0)
-            student_peak_intensity = peak_intensity.repeat_interleave(K + 1, dim=0)
-            student_valid_mask = peak_valid_mask.repeat_interleave(K + 1, dim=0)
-            student_emb = self._encoder_forward(
-                student_peak_mz,
-                student_peak_intensity,
-                valid_mask=student_valid_mask,
-                visible_mask=student_visible.reshape(B * (K + 1), N),
-            ).reshape(B, K + 1, N, -1)
-            context_emb = student_emb[:, 0]
-            target_token_target = student_emb[:, 1:].detach()
+            # Without teacher_encoder, use student encoder with full-view encoding
+            with torch.no_grad():
+                teacher_full = self._encoder_forward(
+                    peak_mz,
+                    peak_intensity,
+                    valid_mask=peak_valid_mask,
+                    visible_mask=peak_valid_mask,
+                ).detach()
+            target_token_target = teacher_full.unsqueeze(1).expand(-1, K, -1, -1)
 
         ctx_mask_v = context_mask.unsqueeze(1)
         context_emb_by_view = context_emb.unsqueeze(1).expand(-1, K, -1, -1)
@@ -1171,9 +1159,20 @@ class PeakSetSIGReg(nn.Module):
                 **collapse_metrics,
             }
             return metrics
-        V = student_emb.shape[1]
-        fused_emb = student_emb.reshape(V * B, N, -1)
-        fused_visible = student_visible.reshape(V * B, N)
+        # Compute target student embeddings for sigreg/gco metrics
+        target_emb = (
+            self._encoder_forward(
+                peak_mz.repeat_interleave(K, dim=0),
+                peak_intensity.repeat_interleave(K, dim=0),
+                valid_mask=peak_valid_mask.repeat_interleave(K, dim=0),
+                visible_mask=target_masks.reshape(B * K, N),
+            ).reshape(B, K, N, -1)
+        )
+        branch_emb = torch.cat([context_emb.unsqueeze(1), target_emb], dim=1)
+        branch_visible = torch.cat([context_mask.unsqueeze(1), target_masks], dim=1)
+        V = branch_emb.shape[1]
+        fused_emb = branch_emb.reshape(V * B, N, -1)
+        fused_visible = branch_visible.reshape(V * B, N)
         with torch.no_grad():
             emb_f = fused_emb.float().reshape(B, V, N, -1)
             mask_f = fused_visible.reshape(B, V, N)
