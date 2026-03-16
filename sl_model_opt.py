@@ -1033,6 +1033,105 @@ class PeakSetSIGReg(nn.Module):
         # Expand to K views (expanded view is fine with CUDA graphs)
         return teacher_full.unsqueeze(1).expand(-1, K, -1, -1)
 
+    def compute_context_emb(
+        self,
+        augmented_batch: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute context embeddings (student encoder). Independent of teacher."""
+        peak_mz = augmented_batch["peak_mz"]
+        peak_intensity = augmented_batch["peak_intensity"]
+        peak_valid_mask = augmented_batch["peak_valid_mask"]
+        context_mask = augmented_batch["context_mask"] & peak_valid_mask
+        return self._encoder_forward(
+            peak_mz,
+            peak_intensity,
+            valid_mask=peak_valid_mask,
+            visible_mask=context_mask,
+            pack_n=19,
+            prefix_pack=True,
+            pad_to=32,
+        )
+
+    def forward_predictor_loss(
+        self,
+        augmented_batch: dict[str, torch.Tensor],
+        context_emb: torch.Tensor,
+        teacher_targets: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Predictor + loss computation given context_emb and teacher_targets."""
+        peak_valid_mask = augmented_batch["peak_valid_mask"]
+        context_mask = augmented_batch["context_mask"] & peak_valid_mask
+        target_masks = augmented_batch["target_masks"] & peak_valid_mask.unsqueeze(1)
+        B, N = augmented_batch["peak_mz"].shape
+        K = self.jepa_num_target_blocks
+        target_token_target = teacher_targets
+
+        ctx_mask_v = context_mask.unsqueeze(1)
+        context_emb_by_view = context_emb.unsqueeze(1).expand(-1, K, -1, -1)
+        predictor_input = context_emb_by_view * ctx_mask_v.unsqueeze(-1)
+        predictor_input = torch.where(
+            target_masks.unsqueeze(-1),
+            self.latent_mask_token.view(1, 1, 1, -1).to(context_emb),
+            predictor_input,
+        )
+        predictor_output = self._predict_masked_latents(
+            predictor_input.reshape(B * K, N, -1),
+            (ctx_mask_v | target_masks).reshape(B * K, N),
+        ).reshape(B, K, N, -1)
+        loss_pred = predictor_output
+        loss_target = target_token_target
+        if self.normalize_jepa_targets:
+            loss_pred = F.normalize(loss_pred, dim=-1)
+            loss_target = F.normalize(loss_target, dim=-1)
+        if self.masked_token_loss_type == "l2":
+            per_token_reg = (loss_pred - loss_target).square().mean(dim=-1)
+        elif self.masked_token_loss_type == "l2_sum":
+            per_token_reg = (loss_pred - loss_target).square().sum(dim=-1)
+        elif self.masked_token_loss_type == "l1":
+            per_token_reg = (loss_pred - loss_target).abs().mean(dim=-1)
+        else:
+            raise ValueError(f"Unsupported masked_token_loss_type: {self.masked_token_loss_type}")
+        target_mask_float = target_masks.float()
+        reg_num = (per_token_reg * target_mask_float).sum()
+        reg_den = target_mask_float.sum().clamp_min(1.0)
+        local_global_loss = reg_num / reg_den
+        sigreg_lambda_current = (
+            self.sigreg_lambda_current.to(dtype=context_emb.dtype)
+            if self.sigreg_lambda_warmup_steps > 0
+            else context_emb.new_tensor(self.sigreg_lambda)
+        )
+        jepa_term = self.masked_token_loss_weight * local_global_loss
+        gco_lambda = self.gco_log_lambda.exp().to(dtype=context_emb.dtype)
+        valid_peak_count = peak_valid_mask.float().sum().clamp_min(1.0)
+        zero = context_emb.new_zeros(())
+        encoder_metric_names = (
+            "emb_std", "emb_norm", "emb_var_mean", "emb_var_floor",
+            "emb_cov_offdiag_abs_mean", "emb_corr_offdiag_abs_mean",
+        )
+        collapse_metrics = {
+            f"{prefix}_{name}": zero
+            for prefix in ("global", "local")
+            for name in encoder_metric_names
+        }
+        return {
+            "loss": jepa_term,
+            "token_sigreg_loss": zero,
+            "local_global_loss": local_global_loss,
+            "sigreg_term": zero,
+            "jepa_term": jepa_term,
+            "target_sigreg_term_over_jepa_term": zero,
+            "context_fraction": context_mask.float().sum() / valid_peak_count,
+            "masked_fraction": target_masks.float().sum() / valid_peak_count,
+            "sigreg_lambda_current": sigreg_lambda_current,
+            "gco_lambda": gco_lambda,
+            "gco_log_lambda": self.gco_log_lambda.to(dtype=context_emb.dtype),
+            "gco_c_ema": self.gco_c_ema.to(dtype=context_emb.dtype),
+            "gco_constraint": zero,
+            **{f"encoder_{name}": zero for name in encoder_metric_names},
+            "local_to_global_emb_std_ratio": zero,
+            **collapse_metrics,
+        }
+
     def forward_augmented(
         self,
         augmented_batch: dict[str, torch.Tensor],
