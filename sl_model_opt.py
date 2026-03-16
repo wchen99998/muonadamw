@@ -1033,30 +1033,10 @@ class PeakSetSIGReg(nn.Module):
         # Expand to K views (expanded view is fine with CUDA graphs)
         return teacher_full.unsqueeze(1).expand(-1, K, -1, -1)
 
-    def encode_context(
-        self,
-        augmented_batch: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """Encode context view. Can overlap with teacher computation."""
-        peak_mz = augmented_batch["peak_mz"]
-        peak_intensity = augmented_batch["peak_intensity"]
-        peak_valid_mask = augmented_batch["peak_valid_mask"]
-        context_mask = augmented_batch["context_mask"] & peak_valid_mask
-        return self._encoder_forward(
-            peak_mz,
-            peak_intensity,
-            valid_mask=peak_valid_mask,
-            visible_mask=context_mask,
-            pack_n=19,
-            prefix_pack=True,
-            pad_to=32,
-        )
-
     def forward_augmented(
         self,
         augmented_batch: dict[str, torch.Tensor],
         teacher_targets: torch.Tensor | None = None,
-        context_emb: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         peak_mz = augmented_batch["peak_mz"]
         peak_intensity = augmented_batch["peak_intensity"]
@@ -1065,17 +1045,17 @@ class PeakSetSIGReg(nn.Module):
         target_masks = augmented_batch["target_masks"] & peak_valid_mask.unsqueeze(1)
         B, N = peak_mz.shape
         K = self.jepa_num_target_blocks
-        # Student encoder: use pre-computed context_emb if available
-        if context_emb is None:
-            context_emb = self._encoder_forward(
-                peak_mz,
-                peak_intensity,
-                valid_mask=peak_valid_mask,
-                visible_mask=context_mask,
-                pack_n=19,
-                prefix_pack=True,
-                pad_to=32,
-            )  # [B, N, D]
+        # Student encoder: only context views (target views unused when teacher is active
+        # and representation_regularizer is "none")
+        context_emb = self._encoder_forward(
+            peak_mz,
+            peak_intensity,
+            valid_mask=peak_valid_mask,
+            visible_mask=context_mask,
+            pack_n=19,
+            prefix_pack=True,  # context tokens are always a contiguous prefix
+            pad_to=32,  # pad to power-of-2 only for Triton attention
+        )  # [B, N, D]
         if teacher_targets is not None:
             target_token_target = teacher_targets
         elif self.teacher_encoder is not None:

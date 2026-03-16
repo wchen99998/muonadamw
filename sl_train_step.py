@@ -44,16 +44,13 @@ class _CUDAGraphRunner:
         self.graph.replay()
         return self.static_output
 
-
-def _get_compiled_encode_context(model):
-    compiled = getattr(model, "_compiled_encode_context", None)
-    if compiled is None:
-        compiled = torch.compile(
-            model.encode_context,
-            mode="max-autotune",
-        )
-        model._compiled_encode_context = compiled
-    return compiled
+    def run_on_stream(self, fn, stream, *args):
+        """Replay the CUDA graph on a separate stream."""
+        if self.graph is None:
+            self._warmup_and_capture(fn, *args)
+        with torch.cuda.stream(stream):
+            self.graph.replay()
+        return self.static_output
 
 
 def _get_compiled_forward_augmented(model):
@@ -99,30 +96,25 @@ def train_step(model, batch, optimizer, autocast_dtype, grad_clip_norm):
         teacher_stream = _get_teacher_stream()
         current_stream = torch.cuda.current_stream()
 
-        # Ensure teacher graph is initialized (first call only)
-        if runner.graph is None:
-            with torch.autocast("cuda", dtype=autocast_dtype):
-                runner.run(model.compute_teacher_targets, batch)
-
-        # Launch teacher CUDA graph replay on separate stream
+        # Launch teacher on separate stream (overlaps with student encoder)
         teacher_stream.wait_stream(current_stream)
-        with torch.cuda.stream(teacher_stream):
-            runner.graph.replay()
-        teacher_targets = runner.static_output
+        with torch.autocast("cuda", dtype=autocast_dtype):
+            teacher_targets = runner.run_on_stream(
+                model.compute_teacher_targets, teacher_stream, batch
+            )
 
-        # Student encoder on default stream (overlaps with teacher on teacher_stream)
+        # Student forward on default stream (encoder overlaps with teacher)
         torch.compiler.cudagraph_mark_step_begin()
-        encode_context = _get_compiled_encode_context(model)
-        with torch.autocast("cuda", dtype=autocast_dtype):
-            context_emb = encode_context(batch)
-
-        # Wait for teacher before predictor+loss (which needs teacher_targets)
-        current_stream.wait_stream(teacher_stream)
-
-        # Predictor + loss using pre-computed context_emb and teacher_targets
         forward_augmented = _get_compiled_forward_augmented(model)
+
+        # The compiled forward starts with the encoder, which doesn't need
+        # teacher_targets. By the time the predictor needs teacher_targets,
+        # the teacher CUDA graph should have completed on its stream.
+        # We synchronize just before calling forward to ensure teacher_targets
+        # is ready (the compiled graph reads it at predictor time).
+        current_stream.wait_stream(teacher_stream)
         with torch.autocast("cuda", dtype=autocast_dtype):
-            metrics = forward_augmented(batch, teacher_targets, context_emb)
+            metrics = forward_augmented(batch, teacher_targets)
     else:
         torch.compiler.cudagraph_mark_step_begin()
         forward_augmented = _get_compiled_forward_augmented(model)
