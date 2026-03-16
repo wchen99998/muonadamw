@@ -1030,8 +1030,8 @@ class PeakSetSIGReg(nn.Module):
             prefix_pack=True,
             pad_to=64,
         )
-        # Expand to K views and make contiguous for CUDA graph compatibility
-        return teacher_full.unsqueeze(1).expand(-1, K, -1, -1).contiguous()
+        # Expand to K views (expanded view is fine with CUDA graphs)
+        return teacher_full.unsqueeze(1).expand(-1, K, -1, -1)
 
     def forward_augmented(
         self,
