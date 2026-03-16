@@ -304,34 +304,17 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         qkv = self.wqkv(x)
 
-        q_size = self.n_heads * self.head_dim
-        kv_size = self.n_kv_heads * self.head_dim
-
-        xq, xk, xv = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+        xq, xk, xv = qkv.split(
+            [self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim,
+             self.n_kv_heads * self.head_dim], dim=-1
+        )
 
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
-        if self.qk_norm:
-            xq = self.q_norm(xq)
-            xk = self.k_norm(xk)
-
         if freqs_cos is not None and freqs_sin is not None:
-            xq, xk = apply_rotary_emb(
-                xq,
-                xk,
-                freqs_cos,
-                freqs_sin,
-            )
-
-        xq = xq.to(dtype=xv.dtype)
-        xk = xk.to(dtype=xv.dtype)
-
-        if self.n_kv_heads != self.n_heads:
-            rep = self.n_heads // self.n_kv_heads
-            xk = xk.repeat_interleave(rep, dim=2)
-            xv = xv.repeat_interleave(rep, dim=2)
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
         if vis_mask is not None:
             attn = masked_attention(xq, xk, xv, vis_mask, block_n=pad_to)
