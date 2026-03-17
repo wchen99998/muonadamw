@@ -28,14 +28,16 @@ PY=~/muonadamw/.venv/bin/python
 A complete PeakSetSIGReg training step (small config: dim=512, 12 layers, 8 heads):
 
 1. `model.advance_sigreg_lambda_schedule()`
-2. Forward: `model.forward_augmented(batch)` — 3 encoder calls (context + 2 target blocks) + teacher encoder + predictor + loss
-3. `loss.backward()`
-4. `clip_grad_norm_` with max_norm=1.0
-5. `optimizer.step()` (MuonAdamW)
-6. `optimizer.zero_grad(set_to_none=True)`
-7. `model.update_teacher()` (EMA update every 10 steps)
+2. Teacher: `model.compute_teacher_targets(batch)` — 1 full-view encoder pass (explicit CUDA graph)
+3. Student forward: `model.forward_augmented(batch, teacher_targets)` — context encoder (pack_n=19) + predictor (4 layers, pack_n=35) + L2 loss
+4. `loss.backward()`
+5. `clip_grad_norm_` with max_norm=1.0
+6. `optimizer.step()` (MuonAdamW)
+7. `optimizer.zero_grad(set_to_none=True)`
+8. `model.update_teacher()` (EMA update every 10 steps)
 
-Batch: 256 samples × 64 peaks, bf16 precision.
+Batch: 256 samples × 64 peaks, bf16 precision. Config: `representation_regularizer="none"`,
+so sigreg/gco are inactive — student forward is context encoder + predictor + L2 loss only.
 
 ---
 
@@ -79,88 +81,147 @@ FOREVER:
 
 ---
 
-## Current Direction: Custom Triton Kernels
+## Current Direction: Fused Megakernels for Transformer Layers
 
-The attention pattern in this model is unique — non-causal, symmetric visibility-mask
-attention (AND of two boolean vectors) with very short sequences (64 tokens) and
-head dim (64). This makes it a poor fit for general-purpose flex_attention and a great
-candidate for hand-written Triton kernels.
+**Current performance: ~16.5 ms / step (~30.5× over reference).**
+Both torch.compile tuning AND simple custom Triton kernels have been exhausted.
+A custom Triton attention kernel (fwd + bwd) is already in place. The next level of
+performance requires **fusing entire sub-layers into megakernels** that eliminate
+intermediate tensor materializations between operations.
 
-**Primary focus: write custom Triton kernels rather than relying on torch.compile tuning.**
-torch.compile gains have plateaued (~26.5 ms). The next level of performance requires
-custom GPU code.
+### Profile breakdown (per step, H100 NVL)
 
-### Priority: Custom Triton Attention (forward + backward)
-- The entire seq_len=64 × head_dim=32 tile fits in SRAM — no multi-block tiling needed.
-- Fuse the visibility mask (simple bool AND) directly into the kernel instead of
-  materializing a BlockMask.
-- Fuse RoPE application into the attention kernel (compute sin/cos inline or load from
-  a small buffer, apply before QK dot product).
-- Write both the forward and backward (dQ, dK, dV) kernels so autograd uses them
-  end-to-end — don't rely on torch.compile to generate the backward.
-- Consider a fused QKV-proj → RoPE → attention → output-proj megakernel if register
-  pressure allows.
+| Category | Time | % | Notes |
+|----------|------|---|-------|
+| cuBLAS GEMMs | 8.3 ms | 55% | QKV proj, output proj, FFN w1/w2 (fwd + bwd + teacher) |
+| LayerNorm | 1.33 ms | 9% | Inductor-generated Triton pointwise |
+| Triton attention | 1.24 ms | 8% | Custom fwd (23 µs) + bwd (37 µs) per call |
+| SiLU activation | 1.2 ms | 8% | Separate kernel after w1 GEMM |
+| Misc pointwise | 1.1 ms | 7% | RoPE, masking, residual add, view ops |
+| BMM (optimizer NS) | 0.61 ms | 4% | Newton–Schulz iteration in MuonAdamW |
+| Optimizer + grad clip | 0.47 ms | 3% | Muon momentum, AdamW, grad norm |
+| Other | 0.7 ms | 5% | Memset, concat, graph launches |
 
-### Priority: Megakernel / Fused Transformer Block
-- Consider fusing LayerNorm + QKV projection + RoPE + attention + output projection
-  into a single Triton kernel (forward + backward).
-- Consider fusing FFN norm + SiLU-gated FFN (w1, w2) into a single kernel.
-- The small dimensions (dim=512, hidden=1366, heads=8, head_dim=64) mean most of these
-  fit comfortably in shared memory / registers — exploit this.
-- Training runs under bf16 autocast — all Triton kernels should operate in bfloat16
-  (inputs, outputs, and accumulation where precision allows). Use fp32 accumulation
-  only where numerically necessary (e.g., softmax reduction, loss computation).
+Theoretical lower bound ≈ 5 ms (memory-bandwidth). The 3.3× gap is mainly from many
+small-kernel launches and intermediate-tensor round-trips through HBM.
 
-### Priority: Sparse-Aware GEMMs
-- The visibility mask means many tokens are invalid (padding) — effective sequence
-  lengths are 32–64 out of 64 slots. The QKV projections and FFN matmuls waste FLOPs
-  on padded positions.
-- Consider gathering only valid tokens before GEMMs and scattering back after, or
-  writing Triton GEMM kernels that skip padded rows entirely.
-- With batched encoder calls (B*(K+1) views), the padding waste is amplified — a
-  sparse/compressed layout could yield significant savings.
-- Alternatively, a block-sparse GEMM approach where blocks corresponding to invalid
-  tokens are skipped at the tile level.
+### Current architecture
 
-### Secondary
-- Fused L2 loss + masking kernel
-- Triton EMA update kernel
-- Fused predictor path (same attention pattern, 4 layers)
+```
+sl_train_step.py:
+  Teacher: torch.compile(max-autotune-no-cudagraphs) + explicit CUDA graph  → 3.25 ms
+  Student: torch.compile(max-autotune, dynamic=False) via CUDAGraphTree     → 6.1 ms fwd, 5.8 ms bwd
+  Optimizer: MuonAdamW (own CUDA graphs)                                     → 0.5 ms
 
-### Step-level (sl_train_step.py)
-- Already well-optimized via torch.compile reduce-overhead.
-- Consider CUDA graphs for the compiled region if Triton kernels enable it.
-- Memory/compute overlap (optimizer with teacher forward, EMA with next batch).
+sl_model_opt.py:
+  Encoder: PeakSetEncoder with sparse prefix-packing
+    - Context: pack_n=19, prefix_pack, pad_to=32, 12 layers
+    - Teacher: pack_n=64, prefix_pack, pad_to=64, 12 layers (in CUDA graph)
+  Predictor: 4 layers, pack_n=35, pad_to=64 (argsort + gather/scatter)
+  Attention: Custom Triton fwd + bwd kernels (fused visibility mask, no FlexAttention)
+  Loss: Simplified L2 path (sigreg/gco dead code removed for this config)
+```
 
-### Pending: Sync full-view teacher encoding (upstream commit 2a24523)
-- Upstream spectra-learning changed teacher target computation: instead of K separate
-  forward passes with per-target-block `visible_mask=target_masks` (via `repeat_interleave`),
-  the teacher now sees the **full valid spectrum once** (`visible_mask=peak_valid_mask`) and
-  the result is expanded to K views via `unsqueeze(1).expand(-1, K, -1, -1)`.
-- The reference model (imported from spectra-learning) already has this change — `sl_prepare.py`
-  regenerated reference artifacts reflect the new semantics.
-- `sl_model_opt.py` still uses the old per-target-block approach in both `compute_teacher_targets`
-  and the `elif self.teacher_encoder` / `else` branches of `forward_augmented` (~lines 1008-1083).
-- **Must update**: `compute_teacher_targets`, `forward_augmented` teacher branch, and
-  `forward_augmented` else branch to match upstream full-view encoding.
-- This is also a performance win: 1 forward pass instead of K (=2), no `repeat_interleave`.
-- **Caveat**: `compute_teacher_targets` is called via `_CUDAGraphRunner` in `sl_train_step.py`.
-  The output shape changes from materialized `[B, K, N, D]` (reshape) to an expanded view —
-  ensure CUDA graph compatibility and/or torch compile compatibility (may need `.contiguous()`).
-- **Opportunity**: With the full-view change eliminating `repeat_interleave` and reducing teacher
-  to a single forward pass, a full `torch.compile` of the entire step (teacher + student + loss)
-  with `max-autotune` may now discover better fusion opportunities that were previously blocked
-  by the K-way expansion. Worth re-evaluating full-step compile after syncing.
-- **Config synced**: `sl_constants.py` now matches upstream `gems_a_masked_latent_index_small.py`
-  (model_dim=512, teacher_ema_decay=1.0, teacher_ema_decay_start=0.996,
-  teacher_ema_decay_warmup_steps=400_000). Reference artifacts regenerated.
+### Priority 1: Fused FFN megakernel (forward + backward)
 
-### What has already been tried and plateaued
-- torch.compile mode variations (reduce-overhead, max-autotune, max-autotune-no-cudagraphs)
-- compile options (coordinate_descent_tuning, aggressive_fusion, max_autotune_gemm)
-- fullgraph=True on various subgraphs
-- SDPA as a flex_attention replacement (failed correctness or regressed)
-- Caching/hoisting minor Python-level overhead (negligible at this point)
+The FFN sub-layer is: `h + w2(SiLU(w1(LayerNorm(h))))`. Today this is 5 separate kernels
+(LayerNorm, w1 GEMM, SiLU, w2 GEMM, residual add) = 2.5 ms combined. A fused kernel
+that tiles along the M dimension, keeping the [BLOCK_M, hidden_dim] intermediate in
+registers / L2, would collapse this to ≈ 2 kernels (fwd GEMM1+SiLU, fwd GEMM2+residual)
+or even 1 kernel if the two GEMMs can be chained through L2.
+
+**Key constraints:**
+- Weight matrices (512 × 1368 each = 1.4 MB bf16) don't fit in shared memory (228 KB)
+  but DO fit in H100 L2 cache (50 MB). A tiled approach loads weights once from HBM
+  per layer; subsequent M-tiles reuse from L2.
+- `torch.autograd.Function` subclasses work inside `torch.compile(fullgraph=True)` —
+  verified. The custom autograd function will NOT break the CUDA graph. The key is that
+  both `forward()` and `backward()` must be traceable. Standard PyTorch ops in the
+  backward are fine (torch.compile generates the backward graph automatically).
+- The backward of SiLU+w2 is: `dh_silu = dy @ W2`, `dh = dh_silu * silu'(h)`,
+  `dW2 = dy^T @ silu(h)`. This requires saving `h` (pre-SiLU w1 output) for backward.
+- Triton GEMMs are ~20–30% slower than cuBLAS for these shapes alone. The fusion must
+  save enough from eliminating the SiLU kernel + intermediate tensor writes to compensate.
+  Exp 17 showed that naively replacing ALL GEMMs with Triton is a 10% regression. Exp 19
+  showed that a custom autograd function with an untuned Triton GEMM regressed 15%
+  — but exp 19's regression was from the slow GEMM, NOT from a graph break.
+- **The approach to beat cuBLAS:** Don't replace cuBLAS; instead, **fuse the prologue**
+  (SiLU applied on-the-fly as w2's input is loaded) into a Triton GEMM for w2. This
+  saves the separate SiLU kernel (~36 µs/call × 16 layers) and the intermediate tensor
+  write+read. Net target: ≈ 0.5–1.0 ms savings.
+
+### Priority 2: Fused attention sub-layer megakernel
+
+The attention sub-layer is: `x + wo(Attn(RoPE(QKV(LayerNorm(x)))))`. Today this is
+LayerNorm kernel → cuBLAS QKV GEMM → RoPE+masking kernel → Triton attention kernel →
+cuBLAS output GEMM → residual add kernel = 6 kernels.
+
+Fusing RoPE into the existing Triton attention kernel was analyzed and found to be
+**marginal** (~100 µs net, <1%) because:
+- The separate RoPE kernel also fuses masking/split/view ops (not just RoPE).
+- The backward requires inverse-RoPE on dQ/dK, which needs a memory round-trip for
+  register-to-register element swapping (Triton can't shuffle within a tile).
+- The forward saves are roughly canceled by the backward overhead.
+
+A more impactful approach: fuse LayerNorm + residual-add across layer boundaries.
+The end of layer N (`h + ffn_out`) and the start of layer N+1 (`LayerNorm(h_next)`)
+touch the same tensor. A persistent kernel that chains layers without writing `h` to
+HBM between them would eliminate ~1.33 ms of LayerNorm overhead.
+
+**This requires a persistent-thread Triton kernel** — extremely complex but the highest
+theoretical payoff. Each thread block processes a slice of M and iterates over all 12
+layers, keeping the activations in L2/registers.
+
+### Priority 3: Stream overlap (teacher ∥ context encoder)
+
+Teacher CUDA graph (3.25 ms) and student context encoder (~2 ms) are independent.
+Overlapping them on separate CUDA streams would save ~2 ms.
+
+**Blocked by CUDAGraphTree:** torch.compile's CUDAGraphTree does not allow its managed
+tensors to be accessed from another stream's CUDA graph (RuntimeError: "accessing tensor
+output of CUDAGraphs that has been overwritten"). Attempts to use `max-autotune-no-cudagraphs`
+for the split functions to avoid this conflict cost ~0.7 ms from losing CUDA graphs,
+negating the overlap benefit (exp 13: 16.741 ms vs 16.5 ms baseline).
+
+**Possible unblock:** Compile context encoder + predictor+loss as a SINGLE function with
+`max-autotune`, and run the teacher explicit CUDA graph on a side stream. The student
+function receives teacher_targets AFTER sync. The issue is that teacher_targets is
+produced by an explicit CUDA graph (static output buffer) — the CUDAGraphTree of the
+student function sees it as an external tensor. This worked in exp 13 for correctness
+but the non-cudagraph compile mode was too slow. The key missing piece: a way to run
+the student on `max-autotune` (with its own CUDA graph) while accepting the teacher's
+static output buffer as input. This may require `torch.compiler.cudagraph_mark_step_begin()`
+and `.clone()` of teacher_targets to detach from the teacher graph's storage.
+
+### What has already been tried and plateaued (experiments 1–23)
+
+**torch.compile tuning (plateaued at ~16.5 ms):**
+- mode variations: reduce-overhead, max-autotune, max-autotune-no-cudagraphs
+- compile options: coordinate_descent_tuning, aggressive_fusion, max_autotune_pointwise
+- max_autotune_gemm_backends="TRITON" (10% regression — cuBLAS is faster for these shapes)
+- fullgraph=True (no graph breaks exist; no improvement)
+- dynamic=False (kept; marginal improvement from explicit static shapes)
+
+**CUDA graph / stream overlap:**
+- Explicit CUDA graph for fwd+bwd+clip (compatibility errors)
+- Overlap teacher with context encoder on separate stream (lost CUDA graphs → regression)
+- reduce-overhead for teacher (CUDAGraphTree conflict with student)
+- max-autotune for teacher inside explicit graph (nested CUDA graph error)
+- Teacher warmup iterations 3→5 (no effect)
+
+**Model-level:**
+- SDPA for teacher attention (regression)
+- Reduced predictor pack_n 35→32 (correctness FAIL — drops valid tokens)
+- Custom fused SiLU+w2 Triton GEMM (15% regression — Triton GEMM too slow vs cuBLAS;
+  graph break confirmed NOT the cause)
+- Expanded attention autotune configs (no improvement — autotuner already found optimal)
+- Stripped zero metrics + simplified loss path + removed dead attention branches (kept;
+  cleaner compiled graph, no measurable speedup)
+
+**Key finding from exp 19:** `torch.autograd.Function` subclasses do NOT break
+`torch.compile(fullgraph=True)`. The regression was purely from the Triton GEMM being
+slower than cuBLAS. This means custom autograd functions are a viable delivery mechanism
+for fused kernels — the GEMM itself just needs to be competitive.
 
 ---
 
